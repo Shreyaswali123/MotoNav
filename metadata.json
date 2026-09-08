@@ -1,0 +1,6 @@
+{
+  "name": "MotoNav",
+  "description": "Motorcycle navigation companion app for route planning and BLE route transfer to ESP32-S3 devices.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

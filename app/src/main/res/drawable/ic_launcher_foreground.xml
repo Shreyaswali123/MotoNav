@@ -1,0 +1,62 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Outer Navigation Radar Arc -->
+    <path
+        android:pathData="M34,42 A24,24 0 0,1 74,42"
+        android:strokeWidth="2.5"
+        android:strokeColor="#5500E5FF"
+        android:strokeLineCap="round" />
+
+    <!-- Navigation Arrowhead / Heading Pointer (High-Vis Amber) -->
+    <path
+        android:fillColor="#FFFFAB00"
+        android:pathData="M54,26 L62,40 L54,36 L46,40 Z" />
+
+    <!-- Motorcycle Silhouette (High-Contrast Clean Vector) -->
+    <!-- Rear Wheel -->
+    <path
+        android:pathData="M35,67 A7,7 0 1,0 35,81 A7,7 0 1,0 35,67 Z"
+        android:strokeWidth="3.2"
+        android:strokeColor="#FFFFFFFF" />
+    <path
+        android:fillColor="#FFFFAB00"
+        android:pathData="M35,71.5 A2.5,2.5 0 1,0 35,76.5 A2.5,2.5 0 1,0 35,71.5 Z" />
+
+    <!-- Front Wheel -->
+    <path
+        android:pathData="M73,67 A7,7 0 1,0 73,81 A7,7 0 1,0 73,67 Z"
+        android:strokeWidth="3.2"
+        android:strokeColor="#FFFFFFFF" />
+    <path
+        android:fillColor="#FFFFAB00"
+        android:pathData="M73,71.5 A2.5,2.5 0 1,0 73,76.5 A2.5,2.5 0 1,0 73,71.5 Z" />
+
+    <!-- Motorcycle Frame, Engine & Tank Body -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M35,74 L46,65 L56,65 L66,54 L73,74 M46,65 L54,74 L62,65"
+        android:strokeWidth="3.2"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- Handlebar & Headlight/Windshield -->
+    <path
+        android:pathData="M65,52 L68,48 L73,48"
+        android:strokeWidth="3"
+        android:strokeColor="#FF00E5FF"
+        android:strokeLineCap="round" />
+
+    <!-- Seat / Tail Cowl -->
+    <path
+        android:pathData="M40,62 L48,62 L52,60"
+        android:strokeWidth="3.5"
+        android:strokeColor="#FFFFAB00"
+        android:strokeLineCap="round" />
+
+</vector>
+
