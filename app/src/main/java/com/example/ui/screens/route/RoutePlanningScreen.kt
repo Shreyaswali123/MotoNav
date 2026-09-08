@@ -76,7 +76,7 @@ import com.example.model.ConnectionState
 import com.example.model.UnitSystem
 import com.example.ui.components.ConnectionStatusBadge
 import com.example.ui.components.ManeuverItemRow
-import com.example.ui.components.MapCanvasView
+import com.example.ui.components.MotoNavMap
 import com.example.ui.theme.MotoAmberLight
 import com.example.ui.theme.MotoAmberPrimary
 import com.example.ui.theme.MotoBackground
@@ -713,7 +713,7 @@ fun RoutePlanningScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    MapCanvasView(
+                    MotoNavMap(
                         route = selectedRoute,
                         modifier = Modifier
                             .fillMaxWidth()
