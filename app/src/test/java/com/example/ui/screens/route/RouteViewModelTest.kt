@@ -45,7 +45,8 @@ class RouteViewModelTest {
 
         var sendTestRouteCalled = false
         var transferRouteCalled = false
-        var transferSerializedRouteCalled = false
+        var transferSerializedRouteCallCount = 0
+        val transferSerializedRouteCalled: Boolean get() = transferSerializedRouteCallCount > 0
         var lastTransferredBinary: ByteArray? = null
         var lastTransferredCrc32: Long? = null
 
@@ -62,18 +63,24 @@ class RouteViewModelTest {
         }
 
         override fun transferSerializedRoute(binary: ByteArray, crc32: Long) {
-            transferSerializedRouteCalled = true
+            transferSerializedRouteCallCount++
             lastTransferredBinary = binary
             lastTransferredCrc32 = crc32
         }
 
         override fun cancelTransfer() {}
-        override fun resetError() {}
-        override fun simulateError() {}
+        override fun resetError() {
+            lastError.value = null
+        }
+        override fun simulateError() {
+            connectionState.value = ConnectionState.Error
+            lastError.value = "Simulated BLE error"
+        }
     }
 
     private class FakeValhallaRouteRepository : ValhallaRouteRepository() {
-        var fetchRouteCalled = false
+        var fetchRouteCallCount = 0
+        val fetchRouteCalled: Boolean get() = fetchRouteCallCount > 0
         var lastOrigin: RoutePoint? = null
         var lastDestination: RoutePoint? = null
         var lastRouteId: Long? = null
@@ -84,7 +91,7 @@ class RouteViewModelTest {
             destination: RoutePoint,
             routeId: Long
         ): Result<RouteConversionResult> {
-            fetchRouteCalled = true
+            fetchRouteCallCount++
             lastOrigin = origin
             lastDestination = destination
             lastRouteId = routeId
@@ -148,7 +155,7 @@ class RouteViewModelTest {
         val fakeResult = createFakeConversionResult()
         fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
 
-        viewModel.sendRouteToMotoNav()
+        viewModel.generateRoute()
         advanceUntilIdle()
 
         assertTrue("ValhallaRouteRepository.fetchRoute() must be invoked", fakeValhallaRepo.fetchRouteCalled)
@@ -162,6 +169,9 @@ class RouteViewModelTest {
         val expectedCrc = 0x98765432L
         val fakeResult = createFakeConversionResult(binary = expectedBinary, crc32 = expectedCrc)
         fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
 
         viewModel.sendRouteToMotoNav()
         advanceUntilIdle()
@@ -179,6 +189,9 @@ class RouteViewModelTest {
         val fakeResult = createFakeConversionResult()
         fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
 
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
         viewModel.sendRouteToMotoNav()
         advanceUntilIdle()
 
@@ -191,7 +204,7 @@ class RouteViewModelTest {
         val networkErrorMsg = "Valhalla server timed out or connection refused"
         fakeValhallaRepo.resultToReturn = Result.failure(IOException(networkErrorMsg))
 
-        viewModel.sendRouteToMotoNav()
+        viewModel.generateRoute()
         advanceUntilIdle()
 
         assertFalse("BLE transferSerializedRoute must NOT be called on Valhalla failure", fakeBleRepo.transferSerializedRouteCalled)
@@ -209,7 +222,7 @@ class RouteViewModelTest {
         val conversionErrorMsg = "Unsupported maneuver structure during conversion"
         fakeValhallaRepo.resultToReturn = Result.failure(IllegalArgumentException(conversionErrorMsg))
 
-        viewModel.sendRouteToMotoNav()
+        viewModel.generateRoute()
         advanceUntilIdle()
 
         assertFalse("BLE transferSerializedRoute must NOT be called on conversion failure", fakeBleRepo.transferSerializedRouteCalled)
@@ -229,7 +242,7 @@ class RouteViewModelTest {
         val selected = viewModel.selectedRoute.value
         assertEquals("Selected route ID should be route_coastal_highway", "route_coastal_highway", selected.id)
 
-        viewModel.sendRouteToMotoNav()
+        viewModel.generateRoute()
         advanceUntilIdle()
 
         assertTrue("ValhallaRouteRepository.fetchRoute() must be invoked", fakeValhallaRepo.fetchRouteCalled)
@@ -243,7 +256,8 @@ class RouteViewModelTest {
         val selected = viewModel.selectedRoute.value
         assertEquals("startLocation should match selected route start", selected.startLocation, viewModel.startLocation.value)
         assertEquals("destination should match selected route destination", selected.destination, viewModel.destination.value)
-        assertTrue("Send route should be enabled initially with valid endpoints", viewModel.isSendRouteEnabled.value)
+        assertTrue("Generate route should be enabled initially with valid endpoints", viewModel.isGenerateRouteEnabled.value)
+        assertFalse("Send route must be disabled initially before generation", viewModel.isSendRouteEnabled.value)
         assertNull("Validation error should be null initially", viewModel.locationValidationError.value)
     }
 
@@ -264,7 +278,8 @@ class RouteViewModelTest {
         assertEquals(15.3610, viewModel.destination.value?.latitude ?: 0.0, 0.0001)
         assertEquals(75.0863, viewModel.destination.value?.longitude ?: 0.0, 0.0001)
 
-        assertTrue("isSendRouteEnabled must be true when distinct valid endpoints are selected", viewModel.isSendRouteEnabled.value)
+        assertTrue("isGenerateRouteEnabled must be true when distinct valid endpoints are selected", viewModel.isGenerateRouteEnabled.value)
+        assertFalse("isSendRouteEnabled must be false until route is generated", viewModel.isSendRouteEnabled.value)
         assertNull(viewModel.locationValidationError.value)
     }
 
@@ -276,6 +291,7 @@ class RouteViewModelTest {
         viewModel.selectDestination(kleTech)
         advanceUntilIdle()
 
+        assertFalse("isGenerateRouteEnabled must be false when start and end are identical", viewModel.isGenerateRouteEnabled.value)
         assertFalse("isSendRouteEnabled must be false when start and end are identical", viewModel.isSendRouteEnabled.value)
         assertEquals("Start and destination cannot be the same location", viewModel.locationValidationError.value)
     }
@@ -286,6 +302,7 @@ class RouteViewModelTest {
         advanceUntilIdle()
 
         assertNull("startLocation should be null after clearing", viewModel.startLocation.value)
+        assertFalse("isGenerateRouteEnabled must be false when startLocation is null", viewModel.isGenerateRouteEnabled.value)
         assertFalse("isSendRouteEnabled must be false when startLocation is null", viewModel.isSendRouteEnabled.value)
     }
 
@@ -295,6 +312,7 @@ class RouteViewModelTest {
         advanceUntilIdle()
 
         assertNull("destination should be null after clearing", viewModel.destination.value)
+        assertFalse("isGenerateRouteEnabled must be false when destination is null", viewModel.isGenerateRouteEnabled.value)
         assertFalse("isSendRouteEnabled must be false when destination is null", viewModel.isSendRouteEnabled.value)
     }
 
@@ -312,12 +330,12 @@ class RouteViewModelTest {
 
         assertEquals("TolanKere, Hubballi", viewModel.startLocation.value?.name)
         assertEquals("KLE Technological University, Hubballi", viewModel.destination.value?.name)
-        assertTrue(viewModel.isSendRouteEnabled.value)
+        assertTrue(viewModel.isGenerateRouteEnabled.value)
+        assertFalse(viewModel.isSendRouteEnabled.value)
     }
 
     @Test
     fun testLocationSearchFindsKLETechAndTolanKere() = runTest(testDispatcher) {
-        // Search for "KLE"
         viewModel.searchLocations("KLE")
         advanceUntilIdle()
 
@@ -328,7 +346,6 @@ class RouteViewModelTest {
             kleResults.any { it.name.contains("KLE", ignoreCase = true) }
         )
 
-        // Search for "TolanKere"
         viewModel.searchLocations("TolanKere")
         advanceUntilIdle()
 
@@ -352,12 +369,341 @@ class RouteViewModelTest {
         viewModel.selectDestination(tolanKere)
         advanceUntilIdle()
 
-        viewModel.sendRouteToMotoNav()
+        viewModel.generateRoute()
         advanceUntilIdle()
 
         assertTrue("ValhallaRouteRepository.fetchRoute() must be invoked", fakeValhallaRepo.fetchRouteCalled)
         assertEquals("Origin sent to Valhalla must match selected startLocation", kleTech, fakeValhallaRepo.lastOrigin)
         assertEquals("Destination sent to Valhalla must match selected destination", tolanKere, fakeValhallaRepo.lastDestination)
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
         assertTrue("BLE transferSerializedRoute must be called", fakeBleRepo.transferSerializedRouteCalled)
+    }
+
+    // =========================================================================
+    // TASK 4: 20 EXPLICIT TESTS
+    // =========================================================================
+
+    @Test
+    fun test01_SelectingOriginAndDestinationDoesNotAutomaticallySendBle() = runTest(testDispatcher) {
+        val kleTech = RoutePoint(15.3647, 75.1240, name = "KLE Technological University, Hubballi")
+        val tolanKere = RoutePoint(15.3610, 75.0863, name = "TolanKere, Hubballi")
+
+        viewModel.selectStartLocation(kleTech)
+        viewModel.selectDestination(tolanKere)
+        advanceUntilIdle()
+
+        assertFalse("Selecting origin + destination must NOT send BLE", fakeBleRepo.transferSerializedRouteCalled)
+        assertFalse("Selecting origin + destination must NOT call Valhalla", fakeValhallaRepo.fetchRouteCalled)
+    }
+
+    @Test
+    fun test02_GenerateRouteCallsValhallaExactlyOnce() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertEquals("generateRoute() must call Valhalla exactly once", 1, fakeValhallaRepo.fetchRouteCallCount)
+    }
+
+    @Test
+    fun test03_SuccessfulGenerateRouteStoresGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        val generated = viewModel.generatedRoute.value
+        org.junit.Assert.assertNotNull("Successful generateRoute() must store generated route in state", generated)
+        assertEquals(fakeResult.simplifiedPoints, generated?.route?.waypoints)
+        assertEquals(fakeResult.totalDistanceMeters, generated?.route?.totalDistanceMeters)
+        assertEquals(fakeResult.durationSeconds, generated?.route?.estimatedDurationSeconds)
+    }
+
+    @Test
+    fun test04_SuccessfulGenerateRouteStoresSerializedBinary() = runTest(testDispatcher) {
+        val expectedBinary = byteArrayOf(0x4D, 0x4E, 0x56, 0x31, 0x01, 0x02, 0x03)
+        val fakeResult = createFakeConversionResult(binary = expectedBinary)
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        val generated = viewModel.generatedRoute.value
+        org.junit.Assert.assertNotNull(generated)
+        assertArrayEquals("Successful generateRoute() must store serialized binary", expectedBinary, generated?.serializedBinary)
+    }
+
+    @Test
+    fun test05_SuccessfulGenerateRouteStoresCrc() = runTest(testDispatcher) {
+        val expectedCrc = 0xFEEDBEEFL
+        val fakeResult = createFakeConversionResult(crc32 = expectedCrc)
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        val generated = viewModel.generatedRoute.value
+        org.junit.Assert.assertNotNull(generated)
+        assertEquals("Successful generateRoute() must store CRC32", expectedCrc, generated?.crc32)
+    }
+
+    @Test
+    fun test06_SuccessfulGenerateRouteDoesNotCallBleTransfer() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertFalse("generateRoute() must NOT call BLE transfer", fakeBleRepo.transferSerializedRouteCalled)
+        assertFalse("generateRoute() must NOT call sendTestRoute", fakeBleRepo.sendTestRouteCalled)
+        assertFalse("generateRoute() must NOT call transferRoute", fakeBleRepo.transferRouteCalled)
+    }
+
+    @Test
+    fun test07_SendRouteToMotoNavAfterSuccessfulGenerationCallsBleTransferExactlyOnce() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        assertEquals(0, fakeBleRepo.transferSerializedRouteCallCount)
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        assertEquals("sendRouteToMotoNav() after generation must call BLE transfer exactly once", 1, fakeBleRepo.transferSerializedRouteCallCount)
+    }
+
+    @Test
+    fun test08_SendRouteToMotoNavDoesNotCallValhallaAgain() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        assertEquals("Valhalla called once for generateRoute()", 1, fakeValhallaRepo.fetchRouteCallCount)
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        assertEquals("sendRouteToMotoNav() must NOT call Valhalla again", 1, fakeValhallaRepo.fetchRouteCallCount)
+    }
+
+    @Test
+    fun test09_BleReceivesExactlyStoredSerializedBinary() = runTest(testDispatcher) {
+        val expectedBinary = byteArrayOf(0x10, 0x20, 0x30, 0x40, 0x50, 0x60)
+        val fakeResult = createFakeConversionResult(binary = expectedBinary)
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        assertArrayEquals("BLE transfer must receive exact stored serialized binary", expectedBinary, fakeBleRepo.lastTransferredBinary)
+    }
+
+    @Test
+    fun test10_BleReceivesExactlyStoredCrc() = runTest(testDispatcher) {
+        val expectedCrc = 0xCAFEBABE01L
+        val fakeResult = createFakeConversionResult(crc32 = expectedCrc)
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        assertEquals("BLE transfer must receive exact stored CRC", expectedCrc, fakeBleRepo.lastTransferredCrc32)
+    }
+
+    @Test
+    fun test11_ChangingOriginInvalidatesGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        org.junit.Assert.assertNotNull(viewModel.generatedRoute.value)
+
+        val newOrigin = RoutePoint(15.3647, 75.1240, name = "KLE Tech")
+        viewModel.selectStartLocation(newOrigin)
+        advanceUntilIdle()
+
+        assertNull("Changing origin must invalidate generated route", viewModel.generatedRoute.value)
+        assertFalse("Send route must be disabled after invalidation", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test12_ChangingDestinationInvalidatesGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        org.junit.Assert.assertNotNull(viewModel.generatedRoute.value)
+
+        val newDest = RoutePoint(15.3610, 75.0863, name = "TolanKere")
+        viewModel.selectDestination(newDest)
+        advanceUntilIdle()
+
+        assertNull("Changing destination must invalidate generated route", viewModel.generatedRoute.value)
+        assertFalse("Send route must be disabled after invalidation", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test13_SwappingLocationsInvalidatesGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        org.junit.Assert.assertNotNull(viewModel.generatedRoute.value)
+
+        viewModel.swapLocations()
+        advanceUntilIdle()
+
+        assertNull("Swapping locations must invalidate generated route", viewModel.generatedRoute.value)
+        assertFalse("Send route must be disabled after swap", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test14_ClearingLocationInvalidatesGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        org.junit.Assert.assertNotNull(viewModel.generatedRoute.value)
+
+        viewModel.clearStartLocation()
+        advanceUntilIdle()
+
+        assertNull("Clearing origin must invalidate generated route", viewModel.generatedRoute.value)
+        assertFalse("Send route must be disabled after clearing", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test15_SendIsDisabledWhenNoGeneratedRouteExists() = runTest(testDispatcher) {
+        // Initially endpoints are populated, but no route has been generated yet
+        advanceUntilIdle()
+
+        assertNull("No generated route initially", viewModel.generatedRoute.value)
+        assertTrue("Generate route should be enabled initially with valid endpoints", viewModel.isGenerateRouteEnabled.value)
+        assertFalse("Send route must be DISABLED when no generated route exists", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test16_SendIsDisabledWhenGeneratedRouteBelongsToOldEndpoints() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        assertTrue("Send route should be enabled after generation", viewModel.isSendRouteEnabled.value)
+
+        // Select a different destination
+        viewModel.selectDestination(RoutePoint(15.5000, 75.2000, name = "New Spot"))
+        advanceUntilIdle()
+
+        assertFalse("Send route must be disabled when generated route belongs to old endpoints", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun test17_ValhallaFailurePreventsBleTransfer() = runTest(testDispatcher) {
+        fakeValhallaRepo.resultToReturn = Result.failure(IOException("Connection refused to Valhalla"))
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertNull("Generated route must be null on Valhalla failure", viewModel.generatedRoute.value)
+        assertFalse("BLE transfer must NOT be called on Valhalla failure", fakeBleRepo.transferSerializedRouteCalled)
+        assertFalse("Send route must remain disabled", viewModel.isSendRouteEnabled.value)
+        assertEquals("Connection refused to Valhalla", viewModel.routeGenerationError.value)
+    }
+
+    @Test
+    fun test18_BleFailureDoesNotDiscardGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        val generatedBeforeTransfer = viewModel.generatedRoute.value
+        org.junit.Assert.assertNotNull(generatedBeforeTransfer)
+
+        // Simulate BLE error
+        fakeBleRepo.simulateError()
+        advanceUntilIdle()
+
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        // Generated route must NOT be discarded
+        assertEquals("Generated route must NOT be discarded on BLE failure", generatedBeforeTransfer, viewModel.generatedRoute.value)
+    }
+
+    @Test
+    fun test19_AfterBleFailureRetryingSendDoesNotCallValhallaAgain() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        assertEquals(1, fakeValhallaRepo.fetchRouteCallCount)
+
+        // Attempt 1: BLE fails
+        fakeBleRepo.simulateError()
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        // Reconnect BLE
+        fakeBleRepo.connectionState.value = ConnectionState.Connected
+        fakeBleRepo.resetError()
+        advanceUntilIdle()
+
+        // Attempt 2: retry Send
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+
+        assertEquals("Valhalla must NOT be called again on retry after BLE failure", 1, fakeValhallaRepo.fetchRouteCallCount)
+        assertEquals("BLE transfer must have been invoked", 1, fakeBleRepo.transferSerializedRouteCallCount)
+    }
+
+    @Test
+    fun test20_SecondSendAttemptUsesExactSameBinaryAndCrc() = runTest(testDispatcher) {
+        val expectedBinary = byteArrayOf(0xAA.toByte(), 0xBB.toByte(), 0xCC.toByte())
+        val expectedCrc = 0x12345678L
+        val fakeResult = createFakeConversionResult(binary = expectedBinary, crc32 = expectedCrc)
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        // First send
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+        val firstBinary = fakeBleRepo.lastTransferredBinary
+        val firstCrc = fakeBleRepo.lastTransferredCrc32
+
+        // Second send
+        viewModel.sendRouteToMotoNav()
+        advanceUntilIdle()
+        val secondBinary = fakeBleRepo.lastTransferredBinary
+        val secondCrc = fakeBleRepo.lastTransferredCrc32
+
+        assertArrayEquals("First send binary must match expected", expectedBinary, firstBinary)
+        assertEquals("First send CRC must match expected", expectedCrc, firstCrc)
+        assertArrayEquals("Second send binary must match first send binary", firstBinary, secondBinary)
+        assertEquals("Second send CRC must match first send CRC", firstCrc, secondCrc)
     }
 }

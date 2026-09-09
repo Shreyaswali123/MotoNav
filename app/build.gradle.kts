@@ -121,7 +121,7 @@ dependencies {
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.logging.interceptor)
   implementation(libs.maplibre.compose)
-  implementation(libs.maplibre.compose.runtime.vulkan)
+  implementation(libs.maplibre.compose.runtime.opengl)
   implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)

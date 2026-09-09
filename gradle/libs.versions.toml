@@ -100,7 +100,7 @@ androidx-credentials = { group = "androidx.credentials", name = "credentials", v
 androidx-credentials-play-services = { group = "androidx.credentials", name = "credentials-play-services-auth", version.ref = "credentials" }
 googleid = { group = "com.google.android.libraries.identity.googleid", name = "googleid", version.ref = "googleid" }
 maplibre-compose = { group = "org.maplibre.compose", name = "maplibre-compose", version.ref = "maplibreCompose" }
-maplibre-compose-runtime-vulkan = { group = "org.maplibre.compose", name = "maplibre-compose-runtime-vulkan-android", version.ref = "maplibreCompose" }
+maplibre-compose-runtime-opengl = { group = "org.maplibre.compose", name = "maplibre-compose-runtime-opengl-android", version.ref = "maplibreCompose" }
 
 
 

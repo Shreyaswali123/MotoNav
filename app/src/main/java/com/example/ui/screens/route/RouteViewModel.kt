@@ -36,6 +36,49 @@ sealed interface RouteGenerationState {
     object Success : RouteGenerationState
 }
 
+/**
+ * Retains the exact generated route, its serialized binary payload, and CRC32
+ * tied to the specific origin and destination coordinates used during generation.
+ */
+data class GeneratedRouteState(
+    val route: Route,
+    val serializedBinary: ByteArray,
+    val crc32: Long,
+    val origin: RoutePoint,
+    val destination: RoutePoint
+) {
+    fun matchesEndpoints(start: RoutePoint?, dest: RoutePoint?): Boolean {
+        if (start == null || dest == null) return false
+        val startLatDiff = abs(origin.latitude - start.latitude)
+        val startLonDiff = abs(origin.longitude - start.longitude)
+        val destLatDiff = abs(destination.latitude - dest.latitude)
+        val destLonDiff = abs(destination.longitude - dest.longitude)
+        return startLatDiff < 0.0001 && startLonDiff < 0.0001 &&
+                destLatDiff < 0.0001 && destLonDiff < 0.0001
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as GeneratedRouteState
+        if (route != other.route) return false
+        if (!serializedBinary.contentEquals(other.serializedBinary)) return false
+        if (crc32 != other.crc32) return false
+        if (origin != other.origin) return false
+        if (destination != other.destination) return false
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = route.hashCode()
+        result = 31 * result + serializedBinary.contentHashCode()
+        result = 31 * result + crc32.hashCode()
+        result = 31 * result + origin.hashCode()
+        result = 31 * result + destination.hashCode()
+        return result
+    }
+}
+
 data class RouteUiState(
     val searchQuery: String = "",
     val availableRoutes: List<Route> = emptyList(),
@@ -46,7 +89,8 @@ data class RouteUiState(
     val unitSystem: UnitSystem = UnitSystem.KILOMETERS,
     val isTransferring: Boolean = false,
     val routeGenerationState: RouteGenerationState = RouteGenerationState.Idle,
-    val routeGenerationError: String? = null
+    val routeGenerationError: String? = null,
+    val generatedRoute: GeneratedRouteState? = null
 )
 
 class RouteViewModel(
@@ -74,6 +118,9 @@ class RouteViewModel(
     private val _selectedRoute = MutableStateFlow(routeRepository.selectedRoute.value)
     val selectedRoute: StateFlow<Route> = _selectedRoute.asStateFlow()
 
+    private val _generatedRoute = MutableStateFlow<GeneratedRouteState?>(null)
+    val generatedRoute: StateFlow<GeneratedRouteState?> = _generatedRoute.asStateFlow()
+
     val connectionState: StateFlow<ConnectionState> = bleRepository.connectionState
     val transferProgress: StateFlow<RouteTransferProgress> = bleRepository.transferProgress
     val unitSystem: StateFlow<UnitSystem> = settingsRepository.preferences
@@ -100,7 +147,7 @@ class RouteViewModel(
 
     val popularLocations: List<SearchLocation> get() = locationSearchRepository.getPopularLocations()
 
-    val isSendRouteEnabled: StateFlow<Boolean> = combine(
+    val isGenerateRouteEnabled: StateFlow<Boolean> = combine(
         _startLocation,
         _destination,
         _isGeneratingRoute,
@@ -111,6 +158,24 @@ class RouteViewModel(
             !areLocationsEqual(start, dest) &&
             !generating &&
             connState != ConnectionState.Transferring
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, initialValue = false)
+
+    val isSendRouteEnabled: StateFlow<Boolean> = combine(
+        _startLocation,
+        _destination,
+        _isGeneratingRoute,
+        _generatedRoute,
+        bleRepository.connectionState
+    ) { start, dest, generating, genRoute, connState ->
+        val isBleReady = connState == ConnectionState.Connected || connState == ConnectionState.RouteReady
+        start != null &&
+            dest != null &&
+            !areLocationsEqual(start, dest) &&
+            !generating &&
+            connState != ConnectionState.Transferring &&
+            isBleReady &&
+            genRoute != null &&
+            genRoute.matchesEndpoints(start, dest)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, initialValue = false)
 
     init {
@@ -135,26 +200,50 @@ class RouteViewModel(
         return true
     }
 
+    private fun invalidateGeneratedRoute() {
+        _generatedRoute.value = null
+        if (_routeGenerationState.value == RouteGenerationState.Success) {
+            _routeGenerationState.value = RouteGenerationState.Idle
+        }
+        _routeGenerationError.value = null
+    }
+
     fun selectStartLocation(point: RoutePoint) {
         _startLocation.value = point
         validateLocations(point, _destination.value)
+        invalidateGeneratedRoute()
         updateSelectedRouteEndpoints()
     }
 
     fun selectDestination(point: RoutePoint) {
         _destination.value = point
         validateLocations(_startLocation.value, point)
+        invalidateGeneratedRoute()
         updateSelectedRouteEndpoints()
     }
 
     fun clearStartLocation() {
         _startLocation.value = null
         _locationValidationError.value = null
+        invalidateGeneratedRoute()
+        _selectedRoute.value = _selectedRoute.value.copy(
+            waypoints = emptyList(),
+            maneuvers = emptyList(),
+            totalDistanceMeters = 0,
+            estimatedDurationSeconds = 0
+        )
     }
 
     fun clearDestination() {
         _destination.value = null
         _locationValidationError.value = null
+        invalidateGeneratedRoute()
+        _selectedRoute.value = _selectedRoute.value.copy(
+            waypoints = emptyList(),
+            maneuvers = emptyList(),
+            totalDistanceMeters = 0,
+            estimatedDurationSeconds = 0
+        )
     }
 
     fun swapLocations() {
@@ -163,6 +252,7 @@ class RouteViewModel(
         _startLocation.value = currentDest
         _destination.value = currentStart
         validateLocations(currentDest, currentStart)
+        invalidateGeneratedRoute()
         updateSelectedRouteEndpoints()
     }
 
@@ -175,12 +265,28 @@ class RouteViewModel(
                 title = title,
                 summary = "Custom route from ${start.name ?: "origin"} to ${dest.name ?: "destination"}",
                 startLocation = start,
-                destination = dest
+                destination = dest,
+                waypoints = emptyList(),
+                maneuvers = emptyList(),
+                totalDistanceMeters = 0,
+                estimatedDurationSeconds = 0
             )
         } else if (start != null) {
-            _selectedRoute.value = _selectedRoute.value.copy(startLocation = start)
+            _selectedRoute.value = _selectedRoute.value.copy(
+                startLocation = start,
+                waypoints = emptyList(),
+                maneuvers = emptyList(),
+                totalDistanceMeters = 0,
+                estimatedDurationSeconds = 0
+            )
         } else if (dest != null) {
-            _selectedRoute.value = _selectedRoute.value.copy(destination = dest)
+            _selectedRoute.value = _selectedRoute.value.copy(
+                destination = dest,
+                waypoints = emptyList(),
+                maneuvers = emptyList(),
+                totalDistanceMeters = 0,
+                estimatedDurationSeconds = 0
+            )
         }
     }
 
@@ -192,10 +298,16 @@ class RouteViewModel(
     fun selectRoute(routeId: String) {
         routeRepository.selectRoute(routeId)
         val route = routeRepository.availableRoutes.find { it.id == routeId } ?: routeRepository.selectedRoute.value
-        _selectedRoute.value = route
+        _selectedRoute.value = route.copy(
+            waypoints = emptyList(),
+            maneuvers = emptyList(),
+            totalDistanceMeters = 0,
+            estimatedDurationSeconds = 0
+        )
         _startLocation.value = route.startLocation
         _destination.value = route.destination
         _locationValidationError.value = null
+        invalidateGeneratedRoute()
     }
 
     fun searchLocations(query: String) {
@@ -207,12 +319,20 @@ class RouteViewModel(
         }
     }
 
-    fun sendRouteToMotoNav() {
+    /**
+     * Generates a motorcycle route between selected origin and destination using Valhalla,
+     * simplifies geometry, serializes to MotoNav v1 format, and stores the resulting route
+     * in ViewModel state for preview.
+     *
+     * Does NOT transmit over BLE.
+     */
+    fun generateRoute() {
         val start = _startLocation.value
         val dest = _destination.value
         if (start == null || dest == null) {
-            _routeGenerationError.value = "Start and destination points must both be selected"
-            _routeGenerationState.value = RouteGenerationState.RouteGenerationError("Start and destination points must both be selected")
+            val error = "Start and destination points must both be selected"
+            _routeGenerationError.value = error
+            _routeGenerationState.value = RouteGenerationState.RouteGenerationError(error)
             return
         }
         if (areLocationsEqual(start, dest)) {
@@ -241,6 +361,7 @@ class RouteViewModel(
 
             if (result.isFailure) {
                 val errorMsg = result.exceptionOrNull()?.message ?: "Failed to generate route from Valhalla"
+                _generatedRoute.value = null
                 _routeGenerationError.value = errorMsg
                 _routeGenerationState.value = RouteGenerationState.RouteGenerationError(errorMsg)
                 _isGeneratingRoute.value = false
@@ -276,7 +397,7 @@ class RouteViewModel(
                 )
             }
 
-            _selectedRoute.value = _selectedRoute.value.copy(
+            val generated = _selectedRoute.value.copy(
                 startLocation = start,
                 destination = dest,
                 totalDistanceMeters = conversion.totalDistanceMeters,
@@ -285,13 +406,61 @@ class RouteViewModel(
                 maneuvers = mappedManeuvers
             )
 
+            _selectedRoute.value = generated
+            _generatedRoute.value = GeneratedRouteState(
+                route = generated,
+                serializedBinary = serialized.binary,
+                crc32 = serialized.crc32,
+                origin = start,
+                destination = dest
+            )
+
             _routeGenerationState.value = RouteGenerationState.Success
             _isGeneratingRoute.value = false
-
-            bleRepository.transferSerializedRoute(
-                serialized.binary,
-                serialized.crc32
-            )
         }
+    }
+
+    /**
+     * Transmits the ALREADY GENERATED route payload to the ESP32 MotoNav device over BLE.
+     * Does NOT call Valhalla again.
+     */
+    fun sendRouteToMotoNav() {
+        val start = _startLocation.value
+        val dest = _destination.value
+        val currentGenerated = _generatedRoute.value
+
+        if (start == null || dest == null) {
+            val error = "Start and destination points must both be selected"
+            _routeGenerationError.value = error
+            _routeGenerationState.value = RouteGenerationState.RouteGenerationError(error)
+            return
+        }
+        if (areLocationsEqual(start, dest)) {
+            val error = "Start and destination cannot be the same location"
+            _locationValidationError.value = error
+            _routeGenerationError.value = error
+            _routeGenerationState.value = RouteGenerationState.RouteGenerationError(error)
+            return
+        }
+        if (currentGenerated == null || !currentGenerated.matchesEndpoints(start, dest)) {
+            val error = "Please generate the route before sending to MotoNav"
+            _routeGenerationError.value = error
+            _routeGenerationState.value = RouteGenerationState.RouteGenerationError(error)
+            return
+        }
+
+        val conn = bleRepository.connectionState.value
+        if (conn != ConnectionState.Connected && conn != ConnectionState.RouteReady) {
+            val error = "MotoNav device is not connected"
+            _routeGenerationError.value = error
+            return
+        }
+
+        // Send the exact stored serialized binary and CRC to the ESP32
+        // Do NOT call Valhalla
+        bleRepository.transferSerializedRoute(
+            currentGenerated.serializedBinary,
+            currentGenerated.crc32
+        )
     }
 }

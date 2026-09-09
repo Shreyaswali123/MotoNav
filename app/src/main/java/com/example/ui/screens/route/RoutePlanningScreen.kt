@@ -42,6 +42,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -84,6 +85,7 @@ import com.example.ui.theme.MotoCardBorder
 import com.example.ui.theme.MotoCardGradientDiagonal
 import com.example.ui.theme.MotoCyanSecondary
 import com.example.ui.theme.MotoLimeReady
+import com.example.ui.theme.MotoRedError
 import com.example.ui.theme.MotoSurface
 import com.example.ui.theme.MotoSurfaceVariant
 import com.example.ui.theme.MotoTextMuted
@@ -112,11 +114,18 @@ fun RoutePlanningScreen(
 
     val startLocation by viewModel.startLocation.collectAsStateWithLifecycle()
     val destination by viewModel.destination.collectAsStateWithLifecycle()
+    val isGenerateRouteEnabled by viewModel.isGenerateRouteEnabled.collectAsStateWithLifecycle()
+    val isGeneratingRoute by viewModel.isGeneratingRoute.collectAsStateWithLifecycle()
+    val generatedRoute by viewModel.generatedRoute.collectAsStateWithLifecycle()
+    val routeGenerationError by viewModel.routeGenerationError.collectAsStateWithLifecycle()
     val isSendRouteEnabled by viewModel.isSendRouteEnabled.collectAsStateWithLifecycle()
     val locationValidationError by viewModel.locationValidationError.collectAsStateWithLifecycle()
     val locationSearchResults by viewModel.locationSearchResults.collectAsStateWithLifecycle()
     val isSearchingLocations by viewModel.isSearchingLocations.collectAsStateWithLifecycle()
     val popularLocations = viewModel.popularLocations
+
+    val hasValidGeneratedRoute = generatedRoute != null &&
+        generatedRoute!!.matchesEndpoints(startLocation, destination)
 
     var showLocationPicker by remember { mutableStateOf(false) }
     var pickerTarget by remember { mutableStateOf(LocationPickerTarget.START) }
@@ -247,16 +256,107 @@ fun RoutePlanningScreen(
                         }
                     }
 
+                    if (routeGenerationError != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp)
+                                .background(MotoRedError.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                .border(1.dp, MotoRedError.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = MotoRedError,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = routeGenerationError ?: "",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    color = MotoRedError,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    // Route Generation Button (Generate Route / Regenerate Route)
+                    Button(
+                        onClick = { viewModel.generateRoute() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(if (hasValidGeneratedRoute) 44.dp else 56.dp)
+                            .clip(RoundedCornerShape(28.dp))
+                            .border(
+                                1.dp,
+                                if (isGenerateRouteEnabled && !isGeneratingRoute) MotoAmberLight.copy(alpha = 0.4f) else MotoCardBorder,
+                                RoundedCornerShape(28.dp)
+                            )
+                            .testTag("generate_route_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (hasValidGeneratedRoute) MotoSurfaceVariant else MotoAmberPrimary,
+                            contentColor = if (hasValidGeneratedRoute) MotoAmberPrimary else Color(0xFF0F1113),
+                            disabledContainerColor = MotoSurfaceVariant,
+                            disabledContentColor = MotoTextMuted
+                        ),
+                        shape = RoundedCornerShape(28.dp),
+                        enabled = isGenerateRouteEnabled && !isGeneratingRoute
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            if (isGeneratingRoute) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    color = Color(0xFF0F1113),
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.DirectionsBike,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                            }
+                            Text(
+                                text = when {
+                                    isGeneratingRoute -> "GENERATING ROUTE..."
+                                    hasValidGeneratedRoute -> "REGENERATE ROUTE"
+                                    startLocation == null && destination == null -> "SELECT START & DESTINATION"
+                                    startLocation == null -> "SELECT START POINT"
+                                    destination == null -> "SELECT DESTINATION"
+                                    locationValidationError != null -> "CHOOSE DIFFERENT DESTINATION"
+                                    else -> "GENERATE ROUTE"
+                                },
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.Black,
+                                    fontSize = 14.sp,
+                                    letterSpacing = 0.5.sp
+                                )
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // BLE Send Button
                     Button(
                         onClick = { viewModel.sendRouteToMotoNav() },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(60.dp)
-                            .clip(RoundedCornerShape(32.dp))
+                            .height(if (hasValidGeneratedRoute) 56.dp else 44.dp)
+                            .clip(RoundedCornerShape(28.dp))
                             .border(
                                 1.5.dp,
                                 if (isSendRouteEnabled) MotoAmberLight.copy(alpha = 0.5f) else MotoCardBorder,
-                                RoundedCornerShape(32.dp)
+                                RoundedCornerShape(28.dp)
                             )
                             .testTag("send_route_to_motonav_button"),
                         colors = ButtonDefaults.buttonColors(
@@ -265,8 +365,8 @@ fun RoutePlanningScreen(
                             disabledContainerColor = MotoSurfaceVariant,
                             disabledContentColor = MotoTextMuted
                         ),
-                        shape = RoundedCornerShape(32.dp),
-                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp),
+                        shape = RoundedCornerShape(28.dp),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = if (isSendRouteEnabled) 4.dp else 0.dp),
                         enabled = isSendRouteEnabled
                     ) {
                         Row(
@@ -276,22 +376,20 @@ fun RoutePlanningScreen(
                             Icon(
                                 imageVector = if (connectionState == ConnectionState.RouteReady) Icons.Default.CheckCircle else Icons.AutoMirrored.Filled.Send,
                                 contentDescription = null,
-                                modifier = Modifier.size(22.dp)
+                                modifier = Modifier.size(20.dp)
                             )
-                            Spacer(modifier = Modifier.width(10.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
                             Text(
                                 text = when {
                                     connectionState == ConnectionState.RouteReady -> "ROUTE READY ON MOTONAV-01"
                                     connectionState == ConnectionState.Transferring -> "SENDING TO MOTONAV..."
-                                    startLocation == null && destination == null -> "SELECT START & DESTINATION"
-                                    startLocation == null -> "SELECT START POINT"
-                                    destination == null -> "SELECT DESTINATION"
-                                    locationValidationError != null -> "CHOOSE DIFFERENT DESTINATION"
+                                    !hasValidGeneratedRoute -> "GENERATE ROUTE FIRST"
+                                    connectionState != ConnectionState.Connected -> "CONNECT DEVICE TO SEND"
                                     else -> "SEND ROUTE TO MOTONAV"
                                 },
                                 style = MaterialTheme.typography.titleMedium.copy(
                                     fontWeight = FontWeight.Black,
-                                    fontSize = 15.sp,
+                                    fontSize = 14.sp,
                                     letterSpacing = 0.5.sp
                                 )
                             )
