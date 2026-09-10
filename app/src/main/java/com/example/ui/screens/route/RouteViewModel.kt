@@ -6,6 +6,7 @@ import com.example.ble.BleRepository
 import com.example.ble.BleRepositoryProvider
 import com.example.data.DefaultLocationSearchRepository
 import com.example.data.LocationSearchRepository
+import com.example.data.LocationSearchResult
 import com.example.data.RouteRepository
 import com.example.data.SampleRouteRepository
 import com.example.data.SearchLocation
@@ -19,6 +20,8 @@ import com.example.model.UnitSystem
 import com.example.network.ValhallaRouteRepository
 import com.example.settings.InMemorySettingsRepository
 import com.example.settings.SettingsRepository
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -145,6 +148,11 @@ class RouteViewModel(
     private val _isSearchingLocations = MutableStateFlow(false)
     val isSearchingLocations: StateFlow<Boolean> = _isSearchingLocations.asStateFlow()
 
+    private val _locationSearchError = MutableStateFlow<String?>(null)
+    val locationSearchError: StateFlow<String?> = _locationSearchError.asStateFlow()
+
+    private var locationSearchJob: Job? = null
+
     val popularLocations: List<SearchLocation> get() = locationSearchRepository.getPopularLocations()
 
     val isGenerateRouteEnabled: StateFlow<Boolean> = combine(
@@ -208,18 +216,46 @@ class RouteViewModel(
         _routeGenerationError.value = null
     }
 
-    fun selectStartLocation(point: RoutePoint) {
+    fun selectStartLocation(point: RoutePoint): Boolean {
+        if (!point.latitude.isFinite() || !point.longitude.isFinite() ||
+            point.latitude !in -90.0..90.0 || point.longitude !in -180.0..180.0) {
+            _locationValidationError.value = "Start location coordinates are invalid"
+            return false
+        }
         _startLocation.value = point
         validateLocations(point, _destination.value)
         invalidateGeneratedRoute()
         updateSelectedRouteEndpoints()
+        return true
     }
 
-    fun selectDestination(point: RoutePoint) {
+    fun selectDestination(point: RoutePoint): Boolean {
+        if (!point.latitude.isFinite() || !point.longitude.isFinite() ||
+            point.latitude !in -90.0..90.0 || point.longitude !in -180.0..180.0) {
+            _locationValidationError.value = "Destination coordinates are invalid"
+            return false
+        }
         _destination.value = point
         validateLocations(_startLocation.value, point)
         invalidateGeneratedRoute()
         updateSelectedRouteEndpoints()
+        return true
+    }
+
+    fun selectStartLocation(location: SearchLocation): Boolean {
+        if (!location.isValid()) {
+            _locationValidationError.value = "Start location coordinates are invalid"
+            return false
+        }
+        return selectStartLocation(location.toRoutePoint())
+    }
+
+    fun selectDestination(location: SearchLocation): Boolean {
+        if (!location.isValid()) {
+            _locationValidationError.value = "Destination coordinates are invalid"
+            return false
+        }
+        return selectDestination(location.toRoutePoint())
     }
 
     fun clearStartLocation() {
@@ -310,11 +346,42 @@ class RouteViewModel(
         invalidateGeneratedRoute()
     }
 
-    fun searchLocations(query: String) {
-        viewModelScope.launch {
-            _isSearchingLocations.value = true
-            val results = locationSearchRepository.searchLocations(query)
-            _locationSearchResults.value = results
+    fun searchLocations(query: String, debounceMs: Long = 400L) {
+        locationSearchJob?.cancel()
+        _locationSearchError.value = null
+
+        val trimmed = query.trim()
+        if (trimmed.isBlank()) {
+            _isSearchingLocations.value = false
+            _locationSearchResults.value = locationSearchRepository.getPopularLocations()
+            _locationSearchError.value = null
+            return
+        }
+
+        _isSearchingLocations.value = true
+        locationSearchJob = viewModelScope.launch {
+            if (debounceMs > 0) {
+                delay(debounceMs)
+            }
+            val currentStart = _startLocation.value
+            when (val result = locationSearchRepository.search(trimmed, currentStart?.latitude, currentStart?.longitude)) {
+                is LocationSearchResult.Success -> {
+                    _locationSearchResults.value = result.locations
+                    _locationSearchError.value = null
+                }
+                is LocationSearchResult.Empty -> {
+                    _locationSearchResults.value = emptyList()
+                    _locationSearchError.value = null
+                }
+                is LocationSearchResult.NetworkError -> {
+                    _locationSearchResults.value = result.fallbackLocations
+                    _locationSearchError.value = result.message
+                }
+                is LocationSearchResult.MalformedResponse -> {
+                    _locationSearchResults.value = emptyList()
+                    _locationSearchError.value = result.message
+                }
+            }
             _isSearchingLocations.value = false
         }
     }

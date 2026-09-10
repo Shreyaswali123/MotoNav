@@ -66,6 +66,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -122,6 +123,7 @@ fun RoutePlanningScreen(
     val locationValidationError by viewModel.locationValidationError.collectAsStateWithLifecycle()
     val locationSearchResults by viewModel.locationSearchResults.collectAsStateWithLifecycle()
     val isSearchingLocations by viewModel.isSearchingLocations.collectAsStateWithLifecycle()
+    val locationSearchError by viewModel.locationSearchError.collectAsStateWithLifecycle()
     val popularLocations = viewModel.popularLocations
 
     val hasValidGeneratedRoute = generatedRoute != null &&
@@ -138,23 +140,27 @@ fun RoutePlanningScreen(
             isSearching = isSearchingLocations,
             searchResults = locationSearchResults,
             popularLocations = popularLocations,
+            errorMessage = locationSearchError,
             onSearchQueryChange = { query ->
                 pickerSearchQuery = query
                 viewModel.searchLocations(query)
             },
             onLocationSelected = { searchLocation ->
-                val point = searchLocation.toRoutePoint()
-                if (pickerTarget == LocationPickerTarget.START) {
-                    viewModel.selectStartLocation(point)
-                } else {
-                    viewModel.selectDestination(point)
+                if (searchLocation.isValid()) {
+                    if (pickerTarget == LocationPickerTarget.START) {
+                        viewModel.selectStartLocation(searchLocation)
+                    } else {
+                        viewModel.selectDestination(searchLocation)
+                    }
+                    showLocationPicker = false
+                    pickerSearchQuery = ""
+                    viewModel.searchLocations("")
                 }
-                showLocationPicker = false
-                pickerSearchQuery = ""
             },
             onDismiss = {
                 showLocationPicker = false
                 pickerSearchQuery = ""
+                viewModel.searchLocations("")
             }
         )
     }
@@ -1016,6 +1022,7 @@ fun LocationSelectionDialog(
     isSearching: Boolean,
     searchResults: List<SearchLocation>,
     popularLocations: List<SearchLocation>,
+    errorMessage: String? = null,
     onSearchQueryChange: (String) -> Unit,
     onLocationSelected: (SearchLocation) -> Unit,
     onDismiss: () -> Unit
@@ -1088,7 +1095,7 @@ fun LocationSelectionDialog(
                         .testTag("location_picker_search_field"),
                     placeholder = {
                         Text(
-                            text = "Enter place name (e.g. KLE Tech, Tolankere)...",
+                            text = "Search place name (e.g. KLE Tech, Goa, Dharwad)...",
                             color = MotoTextMuted,
                             fontSize = 14.sp
                         )
@@ -1151,19 +1158,82 @@ fun LocationSelectionDialog(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                if (displayList.isEmpty() && !isSearching) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "No locations found matching \"$searchQuery\"",
-                            style = MaterialTheme.typography.bodyMedium.copy(color = MotoTextMuted)
-                        )
+                if (errorMessage != null && !isSearching) {
+                    if (searchResults.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .testTag("location_search_error_state"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = MotoRedError,
+                                    modifier = Modifier.size(36.dp)
+                                )
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = errorMessage,
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        color = MotoTextPrimary,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                        }
+                    } else {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .border(1.dp, MotoRedError.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                .testTag("location_search_error_banner"),
+                            color = MotoRedError.copy(alpha = 0.12f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = MotoRedError,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "$errorMessage (showing offline results)",
+                                    style = MaterialTheme.typography.bodySmall.copy(color = MotoTextPrimary)
+                                )
+                            }
+                        }
                     }
-                } else {
+                }
+
+                if (errorMessage == null || searchResults.isNotEmpty()) {
+                    if (displayList.isEmpty() && !isSearching) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .testTag("location_search_empty_state"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "No locations found for \"$searchQuery\"",
+                                style = MaterialTheme.typography.bodyMedium.copy(color = MotoTextMuted),
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    } else if (displayList.isNotEmpty()) {
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1240,6 +1310,7 @@ fun LocationSelectionDialog(
                                 }
                             }
                         }
+                    }
                     }
                 }
             }

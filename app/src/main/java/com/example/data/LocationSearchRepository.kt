@@ -6,6 +6,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -18,7 +19,10 @@ data class SearchLocation(
     val address: String,
     val latitude: Double,
     val longitude: Double,
-    val elevationMeters: Double = 0.0
+    val elevationMeters: Double = 0.0,
+    val importance: Double = 0.0,
+    val placeType: String = "",
+    val category: String = ""
 ) {
     fun toRoutePoint(): RoutePoint = RoutePoint(
         latitude = latitude,
@@ -26,6 +30,28 @@ data class SearchLocation(
         elevationMeters = elevationMeters,
         name = name
     )
+
+    fun isValid(): Boolean {
+        return latitude.isFinite() &&
+            longitude.isFinite() &&
+            latitude in -90.0..90.0 &&
+            longitude in -180.0..180.0
+    }
+}
+
+/**
+ * Result sealed hierarchy for place search operations.
+ */
+sealed class LocationSearchResult {
+    data class Success(val locations: List<SearchLocation>) : LocationSearchResult()
+    data class Empty(val query: String) : LocationSearchResult()
+    data class NetworkError(
+        val message: String = "Unable to search locations. Check your internet connection.",
+        val fallbackLocations: List<SearchLocation> = emptyList()
+    ) : LocationSearchResult()
+    data class MalformedResponse(
+        val message: String = "Unable to parse search results. Please try again."
+    ) : LocationSearchResult()
 }
 
 /**
@@ -33,6 +59,8 @@ data class SearchLocation(
  */
 interface LocationSearchRepository {
     suspend fun searchLocations(query: String): List<SearchLocation>
+    suspend fun search(query: String): LocationSearchResult
+    suspend fun search(query: String, userLatitude: Double?, userLongitude: Double?): LocationSearchResult = search(query)
     fun getPopularLocations(): List<SearchLocation>
 }
 
@@ -41,10 +69,9 @@ interface LocationSearchRepository {
  * preset ride hubs) with live OpenStreetMap Nominatim geocoding fallback.
  */
 class DefaultLocationSearchRepository(
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .build()
+    private val httpClient: OkHttpClient = defaultHttpClient,
+    private val baseUrl: String = DEFAULT_BASE_URL,
+    private val defaultCountryCode: String? = "in"
 ) : LocationSearchRepository {
 
     private val curatedLocations = listOf(
@@ -156,76 +183,205 @@ class DefaultLocationSearchRepository(
 
     override fun getPopularLocations(): List<SearchLocation> = curatedLocations
 
-    override suspend fun searchLocations(query: String): List<SearchLocation> = withContext(Dispatchers.IO) {
-        val cleanQuery = query.trim().lowercase()
-        if (cleanQuery.isBlank()) {
-            return@withContext curatedLocations
+    override suspend fun search(query: String): LocationSearchResult = search(query, null, null)
+
+    override suspend fun search(
+        query: String,
+        userLatitude: Double?,
+        userLongitude: Double?
+    ): LocationSearchResult = withContext(Dispatchers.IO) {
+        val normalizedQuery = PlaceQueryNormalizer.normalize(query)
+        if (normalizedQuery.isBlank()) {
+            return@withContext LocationSearchResult.Success(curatedLocations)
         }
 
-        // 1. Check local curated index first (instant and 100% reliable)
-        val localMatches = curatedLocations.filter { loc ->
-            val nameClean = loc.name.lowercase()
-            val addrClean = loc.address.lowercase()
-            nameClean.contains(cleanQuery) ||
-                addrClean.contains(cleanQuery) ||
-                (cleanQuery.contains("kle") && nameClean.contains("kle")) ||
-                ((cleanQuery.contains("tolan") || cleanQuery.contains("kere")) && nameClean.contains("tolan"))
-        }.toMutableList()
+        val candidates = PlaceQueryNormalizer.getCandidateQueries(query)
+        val primaryQuery = candidates.firstOrNull() ?: normalizedQuery
 
-        // 2. Query OpenStreetMap Nominatim for general queries
-        try {
-            val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-            val url = "https://nominatim.openstreetmap.org/search?q=$encoded&format=json&limit=5&addressdetails=1"
-            val request = Request.Builder()
-                .url(url)
-                .header("User-Agent", "MotoNav-Android-Companion/1.0")
-                .build()
-
-            val response = httpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val bodyString = response.body?.string()
-                if (!bodyString.isNullOrBlank()) {
-                    val jsonArray = JSONArray(bodyString)
-                    for (i in 0 until jsonArray.length()) {
-                        val obj = jsonArray.getJSONObject(i)
-                        val displayName = obj.optString("display_name", "")
-                        val lat = obj.optDouble("lat", 0.0)
-                        val lon = obj.optDouble("lon", 0.0)
-
-                        if (lat != 0.0 && lon != 0.0 && displayName.isNotBlank()) {
-                            // Extract a clean primary title
-                            val parts = displayName.split(",")
-                            val title = if (parts.isNotEmpty()) parts[0].trim() else displayName
-                            val subtitle = if (parts.size > 1) parts.drop(1).joinToString(",").trim() else ""
-
-                            // Avoid duplicates
-                            val isDuplicate = localMatches.any {
-                                Math.abs(it.latitude - lat) < 0.001 && Math.abs(it.longitude - lon) < 0.001
-                            }
-
-                            if (!isDuplicate) {
-                                localMatches.add(
-                                    SearchLocation(
-                                        id = "osm_${obj.optString("place_id", i.toString())}",
-                                        name = title,
-                                        address = subtitle.ifBlank { displayName },
-                                        latitude = lat,
-                                        longitude = lon
-                                    )
-                                )
-                            }
-                        }
+        // 1. Primary query biased toward India (or configured defaultCountryCode)
+        when (val firstResult = queryNominatim(primaryQuery, defaultCountryCode)) {
+            is NominatimFetchResult.Success -> {
+                val ranked = PlaceResultRanker.rankResults(
+                    locations = firstResult.locations,
+                    query = normalizedQuery,
+                    userLatitude = userLatitude,
+                    userLongitude = userLongitude
+                )
+                return@withContext LocationSearchResult.Success(ranked)
+            }
+            is NominatimFetchResult.NetworkError -> {
+                return@withContext LocationSearchResult.NetworkError(
+                    message = firstResult.message,
+                    fallbackLocations = getCuratedMatches(normalizedQuery)
+                )
+            }
+            is NominatimFetchResult.Malformed -> {
+                return@withContext LocationSearchResult.MalformedResponse(firstResult.message)
+            }
+            is NominatimFetchResult.Empty -> {
+                // Primary country-biased search returned empty.
+                // 2. Fall back to global search (no country filter) to not prevent searches outside India
+                if (!defaultCountryCode.isNullOrBlank()) {
+                    val globalResult = queryNominatim(primaryQuery, countryCode = null)
+                    if (globalResult is NominatimFetchResult.Success) {
+                        val ranked = PlaceResultRanker.rankResults(
+                            locations = globalResult.locations,
+                            query = normalizedQuery,
+                            userLatitude = userLatitude,
+                            userLongitude = userLongitude
+                        )
+                        return@withContext LocationSearchResult.Success(ranked)
                     }
                 }
+
+                // 3. If still empty, check alternative candidate queries (abbreviation/alias expansions)
+                for (altQuery in candidates.drop(1)) {
+                    val altResult = queryNominatim(altQuery, defaultCountryCode)
+                    if (altResult is NominatimFetchResult.Success) {
+                        val ranked = PlaceResultRanker.rankResults(
+                            locations = altResult.locations,
+                            query = normalizedQuery,
+                            userLatitude = userLatitude,
+                            userLongitude = userLongitude
+                        )
+                        return@withContext LocationSearchResult.Success(ranked)
+                    }
+                }
+
+                return@withContext LocationSearchResult.Empty(query.trim())
             }
-        } catch (_: Throwable) {
-            // Fall back gracefully to local curated matches if network fails
+        }
+    }
+
+    private sealed class NominatimFetchResult {
+        data class Success(val locations: List<SearchLocation>) : NominatimFetchResult()
+        object Empty : NominatimFetchResult()
+        data class NetworkError(val message: String) : NominatimFetchResult()
+        data class Malformed(val message: String) : NominatimFetchResult()
+    }
+
+    private fun queryNominatim(queryStr: String, countryCode: String?): NominatimFetchResult {
+        val encodedQuery = try {
+            URLEncoder.encode(queryStr, "UTF-8")
+        } catch (e: Exception) {
+            queryStr
         }
 
-        localMatches
+        val countryParam = if (!countryCode.isNullOrBlank()) "&countrycodes=$countryCode" else ""
+        val url = "$baseUrl?q=$encodedQuery&format=json&addressdetails=1&limit=10$countryParam"
+
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "MotoNav-Android-Companion/1.0 (contact: support@motonav.app)")
+            .get()
+            .build()
+
+        val response = try {
+            httpClient.newCall(request).execute()
+        } catch (e: IOException) {
+            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        } catch (e: Throwable) {
+            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        }
+
+        if (!response.isSuccessful) {
+            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        }
+
+        val bodyString = try {
+            response.body?.string()
+        } catch (e: Exception) {
+            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        }
+
+        if (bodyString.isNullOrBlank()) {
+            return NominatimFetchResult.Empty
+        }
+
+        val jsonArray = try {
+            JSONArray(bodyString)
+        } catch (e: Exception) {
+            return NominatimFetchResult.Malformed("Unable to parse search results. Please try again.")
+        }
+
+        if (jsonArray.length() == 0) {
+            return NominatimFetchResult.Empty
+        }
+
+        val results = mutableListOf<SearchLocation>()
+        for (i in 0 until jsonArray.length()) {
+            val obj = jsonArray.optJSONObject(i) ?: continue
+
+            val latStr = obj.optString("lat")
+            val lonStr = obj.optString("lon")
+            val lat = latStr.toDoubleOrNull() ?: if (obj.has("lat")) obj.optDouble("lat", Double.NaN) else Double.NaN
+            val lon = lonStr.toDoubleOrNull() ?: if (obj.has("lon")) obj.optDouble("lon", Double.NaN) else Double.NaN
+
+            if (!lat.isFinite() || !lon.isFinite() || lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+                continue
+            }
+
+            val displayName = obj.optString("display_name", "").trim()
+            val nameProp = obj.optString("name", "").trim()
+
+            val primaryName = when {
+                nameProp.isNotBlank() -> nameProp
+                displayName.isNotBlank() -> displayName.split(",").firstOrNull()?.trim() ?: displayName
+                else -> "Location ($lat, $lon)"
+            }
+
+            val address = if (displayName.isNotBlank()) displayName else primaryName
+            val placeId = obj.optString("place_id", i.toString())
+            val importance = obj.optDouble("importance", 0.0)
+            val placeType = obj.optString("type", "")
+            val category = obj.optString("class", "")
+
+            results.add(
+                SearchLocation(
+                    id = "osm_$placeId",
+                    name = primaryName,
+                    address = address,
+                    latitude = lat,
+                    longitude = lon,
+                    importance = importance,
+                    placeType = placeType,
+                    category = category
+                )
+            )
+        }
+
+        return if (results.isEmpty()) {
+            NominatimFetchResult.Empty
+        } else {
+            NominatimFetchResult.Success(results)
+        }
+    }
+
+    override suspend fun searchLocations(query: String): List<SearchLocation> {
+        return when (val result = search(query)) {
+            is LocationSearchResult.Success -> result.locations
+            is LocationSearchResult.Empty -> emptyList()
+            is LocationSearchResult.NetworkError -> result.fallbackLocations
+            is LocationSearchResult.MalformedResponse -> emptyList()
+        }
+    }
+
+    private fun getCuratedMatches(query: String): List<SearchLocation> {
+        val clean = query.trim().lowercase()
+        if (clean.isBlank()) return curatedLocations
+        return curatedLocations.filter { loc ->
+            loc.name.lowercase().contains(clean) || loc.address.lowercase().contains(clean)
+        }
     }
 
     companion object {
+        const val DEFAULT_BASE_URL = "https://nominatim.openstreetmap.org/search"
+        val defaultHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(5, TimeUnit.SECONDS)
+                .build()
+        }
         val instance: DefaultLocationSearchRepository by lazy { DefaultLocationSearchRepository() }
     }
 }

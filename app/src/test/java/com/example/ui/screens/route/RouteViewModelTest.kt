@@ -1,7 +1,10 @@
 package com.example.ui.screens.route
 
 import com.example.ble.BleRepository
+import com.example.data.LocationSearchRepository
+import com.example.data.LocationSearchResult
 import com.example.data.SampleRouteRepository
+import com.example.data.SearchLocation
 import com.example.model.BleDiagnostics
 import com.example.model.ConnectionState
 import com.example.model.MotoNavDevice
@@ -17,6 +20,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -25,6 +29,7 @@ import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -99,8 +104,38 @@ class RouteViewModelTest {
         }
     }
 
+    private class FakeLocationSearchRepository : LocationSearchRepository {
+        var popularList: List<SearchLocation> = listOf(
+            SearchLocation("loc_kle", "KLE Technological University, Hubballi", "Vidyanagar, Hubballi", 15.3690, 75.1236),
+            SearchLocation("loc_tolan", "TolanKere, Hubballi", "TolanKere Lake, Hubballi", 15.3520, 75.1380)
+        )
+        var searchHandler: (String) -> LocationSearchResult = { q ->
+            val matches = popularList.filter { it.name.contains(q, ignoreCase = true) }
+            if (matches.isNotEmpty()) LocationSearchResult.Success(matches)
+            else LocationSearchResult.Empty(q)
+        }
+        var searchCallCount = 0
+        var lastQuery: String? = null
+
+        override suspend fun search(query: String): LocationSearchResult {
+            searchCallCount++
+            lastQuery = query
+            return searchHandler(query)
+        }
+
+        override suspend fun searchLocations(query: String): List<SearchLocation> {
+            return when (val res = search(query)) {
+                is LocationSearchResult.Success -> res.locations
+                else -> emptyList()
+            }
+        }
+
+        override fun getPopularLocations(): List<SearchLocation> = popularList
+    }
+
     private lateinit var fakeBleRepo: FakeBleRepository
     private lateinit var fakeValhallaRepo: FakeValhallaRouteRepository
+    private lateinit var fakeLocationRepo: FakeLocationSearchRepository
     private lateinit var sampleRouteRepo: SampleRouteRepository
     private lateinit var settingsRepo: InMemorySettingsRepository
     private lateinit var viewModel: RouteViewModel
@@ -110,6 +145,7 @@ class RouteViewModelTest {
         Dispatchers.setMain(testDispatcher)
         fakeBleRepo = FakeBleRepository()
         fakeValhallaRepo = FakeValhallaRouteRepository()
+        fakeLocationRepo = FakeLocationSearchRepository()
         sampleRouteRepo = SampleRouteRepository()
         settingsRepo = InMemorySettingsRepository()
 
@@ -117,7 +153,8 @@ class RouteViewModelTest {
             routeRepository = sampleRouteRepo,
             bleRepository = fakeBleRepo,
             settingsRepository = settingsRepo,
-            valhallaRouteRepository = fakeValhallaRepo
+            valhallaRouteRepository = fakeValhallaRepo,
+            locationSearchRepository = fakeLocationRepo
         )
     }
 
@@ -705,5 +742,122 @@ class RouteViewModelTest {
         assertEquals("First send CRC must match expected", expectedCrc, firstCrc)
         assertArrayEquals("Second send binary must match first send binary", firstBinary, secondBinary)
         assertEquals("Second send CRC must match first send CRC", firstCrc, secondCrc)
+    }
+
+    @Test
+    fun testSelectingRealSearchResultUpdatesStart() = runTest(testDispatcher) {
+        val searchLoc = SearchLocation(
+            id = "osm_101",
+            name = "Hubballi Railway Station",
+            address = "Station Road, Hubballi",
+            latitude = 15.3486,
+            longitude = 75.1481
+        )
+
+        val success = viewModel.selectStartLocation(searchLoc)
+        assertTrue("Selecting valid search location as start should succeed", success)
+
+        val start = viewModel.startLocation.value
+        assertNotNull(start)
+        assertEquals("Hubballi Railway Station", start!!.name)
+        assertEquals(15.3486, start.latitude, 0.00001)
+        assertEquals(75.1481, start.longitude, 0.00001)
+    }
+
+    @Test
+    fun testSelectingRealSearchResultUpdatesDestination() = runTest(testDispatcher) {
+        val searchLoc = SearchLocation(
+            id = "osm_202",
+            name = "Goa Airport",
+            address = "Dabolim, Goa",
+            latitude = 15.3800,
+            longitude = 73.8314
+        )
+
+        val success = viewModel.selectDestination(searchLoc)
+        assertTrue("Selecting valid search location as destination should succeed", success)
+
+        val dest = viewModel.destination.value
+        assertNotNull(dest)
+        assertEquals("Goa Airport", dest!!.name)
+        assertEquals(15.3800, dest.latitude, 0.00001)
+        assertEquals(73.8314, dest.longitude, 0.00001)
+    }
+
+    @Test
+    fun testDebouncingCancelsIntermediateRequests() = runTest(testDispatcher) {
+        // Rapid keystrokes within debounce window (300ms)
+        viewModel.searchLocations("D", debounceMs = 300L)
+        advanceTimeBy(100)
+        viewModel.searchLocations("Dh", debounceMs = 300L)
+        advanceTimeBy(100)
+        viewModel.searchLocations("Dharwad", debounceMs = 300L)
+        advanceTimeBy(350)
+        advanceUntilIdle()
+
+        // Only the final query "Dharwad" should have triggered the repository
+        assertEquals("Only one repository search should execute after debounce", 1, fakeLocationRepo.searchCallCount)
+        assertEquals("Last query searched should be the debounced query", "Dharwad", fakeLocationRepo.lastQuery)
+    }
+
+    @Test
+    fun testEmptySearchQueryRestoresPopularLocations() = runTest(testDispatcher) {
+        // Perform search
+        viewModel.searchLocations("KLE", debounceMs = 0L)
+        advanceUntilIdle()
+
+        // Clear query
+        viewModel.searchLocations("", debounceMs = 0L)
+        advanceUntilIdle()
+
+        val results = viewModel.locationSearchResults.value
+        assertEquals("Empty search query should restore popular locations", fakeLocationRepo.popularList.size, results.size)
+        assertNull("Search error should be cleared on empty query", viewModel.locationSearchError.value)
+    }
+
+    @Test
+    fun testNetworkFailureSetsLocationSearchError() = runTest(testDispatcher) {
+        val fallbackList = fakeLocationRepo.popularList
+        fakeLocationRepo.searchHandler = {
+            LocationSearchResult.NetworkError("Unable to search locations. Check your internet connection.", fallbackList)
+        }
+
+        viewModel.searchLocations("Arbitrary Place", debounceMs = 0L)
+        advanceUntilIdle()
+
+        assertEquals("Unable to search locations. Check your internet connection.", viewModel.locationSearchError.value)
+        assertEquals(fallbackList.size, viewModel.locationSearchResults.value.size)
+    }
+
+    @Test
+    fun testEmptyResultSetsNoSearchError() = runTest(testDispatcher) {
+        fakeLocationRepo.searchHandler = { q ->
+            LocationSearchResult.Empty(q)
+        }
+
+        viewModel.searchLocations("nonexistent place", debounceMs = 0L)
+        advanceUntilIdle()
+
+        assertNull("Empty result should NOT set an error", viewModel.locationSearchError.value)
+        assertTrue("Empty result should produce empty location results", viewModel.locationSearchResults.value.isEmpty())
+    }
+
+    @Test
+    fun testSelectingMalformedLocationIsSafelyRejected() = runTest(testDispatcher) {
+        val invalidLoc = SearchLocation(
+            id = "bad_1",
+            name = "Invalid Coord Place",
+            address = "Unknown",
+            latitude = 999.0, // Invalid latitude > 90
+            longitude = 75.0
+        )
+
+        val startSuccess = viewModel.selectStartLocation(invalidLoc)
+        assertFalse("Selecting invalid coordinates should return false", startSuccess)
+        assertEquals("Start location coordinates are invalid", viewModel.locationValidationError.value)
+
+        val destSuccess = viewModel.selectDestination(invalidLoc)
+        assertFalse("Selecting invalid coordinates should return false", destSuccess)
+        assertEquals("Destination coordinates are invalid", viewModel.locationValidationError.value)
     }
 }
