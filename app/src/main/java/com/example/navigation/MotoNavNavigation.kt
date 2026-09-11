@@ -78,8 +78,12 @@ fun MotoNavApp(
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route ?: Screen.HOME.route
 
-    val homeViewModel: HomeViewModel = viewModel()
     val routeViewModel: RouteViewModel = viewModel()
+    val homeViewModel: HomeViewModel = viewModel(
+        factory = HomeViewModel.provideFactory(
+            activeRoute = routeViewModel.selectedRoute
+        )
+    )
     val deviceViewModel: DeviceViewModel = viewModel()
     val settingsViewModel: SettingsViewModel = viewModel()
 
@@ -152,6 +156,7 @@ fun MotoNavApp(
             composable(Screen.HOME.route) {
                 HomeScreen(
                     viewModel = homeViewModel,
+                    routeViewModel = routeViewModel,
                     onNavigateToRoutePlanning = { navController.navigate(Screen.ROUTE.route) },
                     onNavigateToDevice = { navController.navigate(Screen.DEVICE.route) },
                     onNavigateToSettings = { navController.navigate(Screen.SETTINGS.route) }

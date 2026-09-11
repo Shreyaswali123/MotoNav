@@ -54,6 +54,7 @@ import com.example.ble.BlePermissions
 import com.example.model.ConnectionState
 import com.example.model.UnitSystem
 import com.example.ui.components.ConnectionStatusBadge
+import com.example.ui.screens.route.RouteViewModel
 import com.example.ui.theme.MotoAccentGradient
 import com.example.ui.theme.MotoAccentGlow
 import com.example.ui.theme.MotoAmberLight
@@ -75,11 +76,13 @@ fun HomeScreen(
     onNavigateToRoutePlanning: () -> Unit,
     onNavigateToDevice: () -> Unit,
     onNavigateToSettings: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    routeViewModel: RouteViewModel? = null
 ) {
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
     val connectedDevice by viewModel.connectedDevice.collectAsStateWithLifecycle()
-    val activeRoute by viewModel.activeRoute.collectAsStateWithLifecycle()
+    val activeRouteFlow = routeViewModel?.selectedRoute ?: viewModel.activeRoute
+    val activeRoute by activeRouteFlow.collectAsStateWithLifecycle()
     val unitSystem by viewModel.unitSystem.collectAsStateWithLifecycle()
 
     val context = LocalContext.current

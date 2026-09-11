@@ -260,6 +260,32 @@ fun RoutePlanningScreen(
                                 trackColor = MotoSurfaceVariant
                             )
                         }
+
+                        Button(
+                            onClick = { viewModel.cancelTransfer() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("route_cancel_transfer_button"),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MotoSurfaceVariant,
+                                contentColor = MotoRedError
+                            ),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MotoRedError.copy(alpha = 0.7f)),
+                            shape = RoundedCornerShape(22.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Cancel transfer",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "CANCEL TRANSFER",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
                     }
 
                     if (routeGenerationError != null) {

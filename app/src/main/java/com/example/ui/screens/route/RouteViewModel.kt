@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 sealed interface RouteGenerationState {
@@ -96,6 +97,21 @@ data class RouteUiState(
     val generatedRoute: GeneratedRouteState? = null
 )
 
+val RouteTransferProgress.isTransferring: Boolean
+    get() = (totalPackets > 0 && currentPacket < totalPackets) ||
+        stepDescription.equals("Transferring", ignoreCase = true) ||
+        stepDescription.startsWith("Transferring", ignoreCase = true) ||
+        (percentage in 1..99)
+
+fun RouteTransferProgress(isTransferring: Boolean, percentage: Int = 0): RouteTransferProgress {
+    return RouteTransferProgress(
+        percentage = percentage,
+        currentPacket = if (isTransferring) 1 else 0,
+        totalPackets = if (isTransferring) 2 else 0,
+        stepDescription = if (isTransferring) "Transferring" else "Idle"
+    )
+}
+
 class RouteViewModel(
     private val routeRepository: RouteRepository = SampleRouteRepository.instance,
     private val bleRepository: BleRepository = BleRepositoryProvider.instance,
@@ -141,6 +157,7 @@ class RouteViewModel(
 
     private val _isGeneratingRoute = MutableStateFlow(false)
     val isGeneratingRoute: StateFlow<Boolean> = _isGeneratingRoute.asStateFlow()
+    private val isGenerationInProgress = AtomicBoolean(false)
 
     private val _locationSearchResults = MutableStateFlow<List<SearchLocation>>(locationSearchRepository.getPopularLocations())
     val locationSearchResults: StateFlow<List<SearchLocation>> = _locationSearchResults.asStateFlow()
@@ -377,6 +394,10 @@ class RouteViewModel(
                     _locationSearchResults.value = result.fallbackLocations
                     _locationSearchError.value = result.message
                 }
+                is LocationSearchResult.RateLimited -> {
+                    _locationSearchResults.value = result.fallbackLocations
+                    _locationSearchError.value = result.message
+                }
                 is LocationSearchResult.MalformedResponse -> {
                     _locationSearchResults.value = emptyList()
                     _locationSearchError.value = result.message
@@ -410,80 +431,102 @@ class RouteViewModel(
             return
         }
 
+        val isTransferring = bleRepository.connectionState.value == ConnectionState.Transferring ||
+            bleRepository.transferProgress.value.isTransferring
+        if (isTransferring) {
+            val error = "Cannot generate route while transfer is in progress"
+            _routeGenerationError.value = error
+            _routeGenerationState.value = RouteGenerationState.RouteGenerationError(error)
+            return
+        }
+
+        if (!isGenerationInProgress.compareAndSet(false, true)) {
+            return
+        }
+        _isGeneratingRoute.value = true
+
         viewModelScope.launch {
-            _isGeneratingRoute.value = true
             _routeGenerationError.value = null
             _routeGenerationState.value = RouteGenerationState.GeneratingRoute
 
-            val routeId = _selectedRoute.value.id.toLongOrNull() ?: 1L
-            val result = try {
-                valhallaRouteRepository.fetchRoute(
-                    origin = start,
+            try {
+                val routeId = _selectedRoute.value.id.toLongOrNull() ?: 1L
+                val result = try {
+                    valhallaRouteRepository.fetchRoute(
+                        origin = start,
+                        destination = dest,
+                        routeId = routeId
+                    )
+                } catch (e: Throwable) {
+                    Result.failure(e)
+                }
+
+                if (result.isFailure) {
+                    val errorMsg = result.exceptionOrNull()?.message ?: "Failed to generate route from Valhalla"
+                    _generatedRoute.value = null
+                    _selectedRoute.value = _selectedRoute.value.copy(
+                        waypoints = emptyList(),
+                        maneuvers = emptyList(),
+                        totalDistanceMeters = 0,
+                        estimatedDurationSeconds = 0
+                    )
+                    _routeGenerationError.value = errorMsg
+                    _routeGenerationState.value = RouteGenerationState.RouteGenerationError(errorMsg)
+                    return@launch
+                }
+
+                val conversion = result.getOrThrow()
+                val serialized = conversion.serializedRoute
+
+                val mappedManeuvers = conversion.maneuvers.mapIndexed { index, record ->
+                    val point = conversion.simplifiedPoints.getOrElse(record.pointIndex) {
+                        conversion.simplifiedPoints.lastOrNull() ?: dest
+                    }
+                    val maneuverType = when (record.motoNavType) {
+                        1.toByte() -> ManeuverType.TURN_LEFT
+                        2.toByte() -> ManeuverType.TURN_RIGHT
+                        5.toByte() -> ManeuverType.ARRIVE
+                        else -> ManeuverType.STRAIGHT
+                    }
+                    val instructionText = record.instruction ?: when (record.motoNavType) {
+                        1.toByte() -> "Turn left"
+                        2.toByte() -> "Turn right"
+                        5.toByte() -> "Arrive at destination"
+                        else -> "Continue straight"
+                    }
+                    Maneuver(
+                        id = "gen_${index}_${record.pointIndex}",
+                        type = maneuverType,
+                        instruction = instructionText,
+                        roadName = "",
+                        distanceMeters = record.distanceMeters,
+                        point = point
+                    )
+                }
+
+                val generated = _selectedRoute.value.copy(
+                    startLocation = start,
                     destination = dest,
-                    routeId = routeId
+                    totalDistanceMeters = conversion.totalDistanceMeters,
+                    estimatedDurationSeconds = conversion.durationSeconds,
+                    waypoints = conversion.simplifiedPoints,
+                    maneuvers = mappedManeuvers
                 )
-            } catch (e: Throwable) {
-                Result.failure(e)
-            }
 
-            if (result.isFailure) {
-                val errorMsg = result.exceptionOrNull()?.message ?: "Failed to generate route from Valhalla"
-                _generatedRoute.value = null
-                _routeGenerationError.value = errorMsg
-                _routeGenerationState.value = RouteGenerationState.RouteGenerationError(errorMsg)
+                _selectedRoute.value = generated
+                _generatedRoute.value = GeneratedRouteState(
+                    route = generated,
+                    serializedBinary = serialized.binary,
+                    crc32 = serialized.crc32,
+                    origin = start,
+                    destination = dest
+                )
+
+                _routeGenerationState.value = RouteGenerationState.Success
+            } finally {
                 _isGeneratingRoute.value = false
-                return@launch
+                isGenerationInProgress.set(false)
             }
-
-            val conversion = result.getOrThrow()
-            val serialized = conversion.serializedRoute
-
-            val mappedManeuvers = conversion.maneuvers.mapIndexed { index, record ->
-                val point = conversion.simplifiedPoints.getOrElse(record.pointIndex) {
-                    conversion.simplifiedPoints.lastOrNull() ?: dest
-                }
-                val maneuverType = when (record.motoNavType) {
-                    1.toByte() -> ManeuverType.TURN_LEFT
-                    2.toByte() -> ManeuverType.TURN_RIGHT
-                    5.toByte() -> ManeuverType.ARRIVE
-                    else -> ManeuverType.STRAIGHT
-                }
-                val instructionText = record.instruction ?: when (record.motoNavType) {
-                    1.toByte() -> "Turn left"
-                    2.toByte() -> "Turn right"
-                    5.toByte() -> "Arrive at destination"
-                    else -> "Continue straight"
-                }
-                Maneuver(
-                    id = "gen_${index}_${record.pointIndex}",
-                    type = maneuverType,
-                    instruction = instructionText,
-                    roadName = "",
-                    distanceMeters = record.distanceMeters,
-                    point = point
-                )
-            }
-
-            val generated = _selectedRoute.value.copy(
-                startLocation = start,
-                destination = dest,
-                totalDistanceMeters = conversion.totalDistanceMeters,
-                estimatedDurationSeconds = conversion.durationSeconds,
-                waypoints = conversion.simplifiedPoints,
-                maneuvers = mappedManeuvers
-            )
-
-            _selectedRoute.value = generated
-            _generatedRoute.value = GeneratedRouteState(
-                route = generated,
-                serializedBinary = serialized.binary,
-                crc32 = serialized.crc32,
-                origin = start,
-                destination = dest
-            )
-
-            _routeGenerationState.value = RouteGenerationState.Success
-            _isGeneratingRoute.value = false
         }
     }
 
@@ -529,5 +572,9 @@ class RouteViewModel(
             currentGenerated.serializedBinary,
             currentGenerated.crc32
         )
+    }
+
+    fun cancelTransfer() {
+        bleRepository.cancelTransfer()
     }
 }

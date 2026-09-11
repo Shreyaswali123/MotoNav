@@ -1,7 +1,16 @@
 package com.example.data
 
 import com.example.model.RoutePoint
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -9,6 +18,8 @@ import org.json.JSONArray
 import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Data model for a searchable geographic place.
@@ -39,6 +50,8 @@ data class SearchLocation(
     }
 }
 
+const val DEFAULT_RATE_LIMITED_MESSAGE = "Search service is temporarily busy. Please wait a moment and try again."
+
 /**
  * Result sealed hierarchy for place search operations.
  */
@@ -51,6 +64,10 @@ sealed class LocationSearchResult {
     ) : LocationSearchResult()
     data class MalformedResponse(
         val message: String = "Unable to parse search results. Please try again."
+    ) : LocationSearchResult()
+    data class RateLimited(
+        val message: String = DEFAULT_RATE_LIMITED_MESSAGE,
+        val fallbackLocations: List<SearchLocation> = emptyList()
     ) : LocationSearchResult()
 }
 
@@ -71,7 +88,10 @@ interface LocationSearchRepository {
 class DefaultLocationSearchRepository(
     private val httpClient: OkHttpClient = defaultHttpClient,
     private val baseUrl: String = DEFAULT_BASE_URL,
-    private val defaultCountryCode: String? = "in"
+    private val defaultCountryCode: String? = "in",
+    private val minRequestIntervalMs: Long = DEFAULT_MIN_REQUEST_INTERVAL_MS,
+    private val nanoTimeProvider: () -> Long = { System.nanoTime() },
+    private val delayer: suspend (Long) -> Unit = { delay(it) }
 ) : LocationSearchRepository {
 
     private val curatedLocations = listOf(
@@ -190,6 +210,7 @@ class DefaultLocationSearchRepository(
         userLatitude: Double?,
         userLongitude: Double?
     ): LocationSearchResult = withContext(Dispatchers.IO) {
+        currentCoroutineContext().ensureActive()
         val normalizedQuery = PlaceQueryNormalizer.normalize(query)
         if (normalizedQuery.isBlank()) {
             return@withContext LocationSearchResult.Success(curatedLocations)
@@ -197,6 +218,8 @@ class DefaultLocationSearchRepository(
 
         val candidates = PlaceQueryNormalizer.getCandidateQueries(query)
         val primaryQuery = candidates.firstOrNull() ?: normalizedQuery
+
+        currentCoroutineContext().ensureActive()
 
         // 1. Primary query biased toward India (or configured defaultCountryCode)
         when (val firstResult = queryNominatim(primaryQuery, defaultCountryCode)) {
@@ -208,6 +231,12 @@ class DefaultLocationSearchRepository(
                     userLongitude = userLongitude
                 )
                 return@withContext LocationSearchResult.Success(ranked)
+            }
+            is NominatimFetchResult.RateLimited -> {
+                return@withContext LocationSearchResult.RateLimited(
+                    message = firstResult.message,
+                    fallbackLocations = getCuratedMatches(normalizedQuery)
+                )
             }
             is NominatimFetchResult.NetworkError -> {
                 return@withContext LocationSearchResult.NetworkError(
@@ -222,34 +251,122 @@ class DefaultLocationSearchRepository(
                 // Primary country-biased search returned empty.
                 // 2. Fall back to global search (no country filter) to not prevent searches outside India
                 if (!defaultCountryCode.isNullOrBlank()) {
+                    currentCoroutineContext().ensureActive()
                     val globalResult = queryNominatim(primaryQuery, countryCode = null)
-                    if (globalResult is NominatimFetchResult.Success) {
-                        val ranked = PlaceResultRanker.rankResults(
-                            locations = globalResult.locations,
-                            query = normalizedQuery,
-                            userLatitude = userLatitude,
-                            userLongitude = userLongitude
-                        )
-                        return@withContext LocationSearchResult.Success(ranked)
+                    when (globalResult) {
+                        is NominatimFetchResult.Success -> {
+                            val ranked = PlaceResultRanker.rankResults(
+                                locations = globalResult.locations,
+                                query = normalizedQuery,
+                                userLatitude = userLatitude,
+                                userLongitude = userLongitude
+                            )
+                            return@withContext LocationSearchResult.Success(ranked)
+                        }
+                        is NominatimFetchResult.RateLimited -> {
+                            return@withContext LocationSearchResult.RateLimited(
+                                message = globalResult.message,
+                                fallbackLocations = getCuratedMatches(normalizedQuery)
+                            )
+                        }
+                        else -> { /* continue to alternative candidates */ }
                     }
                 }
 
                 // 3. If still empty, check alternative candidate queries (abbreviation/alias expansions)
                 for (altQuery in candidates.drop(1)) {
+                    currentCoroutineContext().ensureActive()
                     val altResult = queryNominatim(altQuery, defaultCountryCode)
-                    if (altResult is NominatimFetchResult.Success) {
-                        val ranked = PlaceResultRanker.rankResults(
-                            locations = altResult.locations,
-                            query = normalizedQuery,
-                            userLatitude = userLatitude,
-                            userLongitude = userLongitude
-                        )
-                        return@withContext LocationSearchResult.Success(ranked)
+                    when (altResult) {
+                        is NominatimFetchResult.Success -> {
+                            val ranked = PlaceResultRanker.rankResults(
+                                locations = altResult.locations,
+                                query = normalizedQuery,
+                                userLatitude = userLatitude,
+                                userLongitude = userLongitude
+                            )
+                            return@withContext LocationSearchResult.Success(ranked)
+                        }
+                        is NominatimFetchResult.RateLimited -> {
+                            return@withContext LocationSearchResult.RateLimited(
+                                message = altResult.message,
+                                fallbackLocations = getCuratedMatches(normalizedQuery)
+                            )
+                        }
+                        else -> { /* continue */ }
                     }
                 }
 
+                currentCoroutineContext().ensureActive()
                 return@withContext LocationSearchResult.Empty(query.trim())
             }
+        }
+    }
+
+    data class CacheKey(
+        val normalizedQuery: String,
+        val countryCode: String?
+    )
+
+    private class LruQueryCache(private val maxSize: Int = DEFAULT_CACHE_MAX_SIZE) {
+        private val lock = Any()
+        private val map = LinkedHashMap<CacheKey, NominatimFetchResult>(maxSize, 0.75f, true)
+
+        fun get(key: CacheKey): NominatimFetchResult? {
+            synchronized(lock) {
+                return map[key]
+            }
+        }
+
+        fun put(key: CacheKey, result: NominatimFetchResult) {
+            synchronized(lock) {
+                map[key] = result
+                if (map.size > maxSize) {
+                    val eldestKey = map.keys.iterator().next()
+                    map.remove(eldestKey)
+                }
+            }
+        }
+
+        fun size(): Int {
+            synchronized(lock) {
+                return map.size
+            }
+        }
+
+        fun clear() {
+            synchronized(lock) {
+                map.clear()
+            }
+        }
+    }
+
+    private val queryCache = LruQueryCache(DEFAULT_CACHE_MAX_SIZE)
+    private val rateLimitMutex = Mutex()
+    private var lastDispatchNanoTime: Long = 0L
+
+    internal fun clearCache() = queryCache.clear()
+    internal fun cacheSize(): Int = queryCache.size()
+    internal fun lastDispatchNanoTime(): Long = lastDispatchNanoTime
+
+    private suspend fun paceNominatimRequest() {
+        rateLimitMutex.withLock {
+            currentCoroutineContext().ensureActive()
+            if (minRequestIntervalMs > 0) {
+                val now = nanoTimeProvider()
+                val minIntervalNanos = TimeUnit.MILLISECONDS.toNanos(minRequestIntervalMs)
+                val elapsedNanos = now - lastDispatchNanoTime
+                if (lastDispatchNanoTime != 0L && elapsedNanos < minIntervalNanos) {
+                    val delayNanos = minIntervalNanos - elapsedNanos
+                    val delayMs = TimeUnit.NANOSECONDS.toMillis(delayNanos)
+                    val effectiveDelayMs = if (delayNanos % 1_000_000L != 0L) delayMs + 1 else delayMs
+                    if (effectiveDelayMs > 0) {
+                        delayer(effectiveDelayMs)
+                    }
+                }
+            }
+            currentCoroutineContext().ensureActive()
+            lastDispatchNanoTime = nanoTimeProvider()
         }
     }
 
@@ -258,16 +375,36 @@ class DefaultLocationSearchRepository(
         object Empty : NominatimFetchResult()
         data class NetworkError(val message: String) : NominatimFetchResult()
         data class Malformed(val message: String) : NominatimFetchResult()
+        data class RateLimited(val message: String = DEFAULT_RATE_LIMITED_MESSAGE) : NominatimFetchResult()
     }
 
-    private fun queryNominatim(queryStr: String, countryCode: String?): NominatimFetchResult {
+    private class HttpStatusException(val code: Int) : Exception("HTTP $code")
+
+    private suspend fun queryNominatim(queryStr: String, countryCode: String?): NominatimFetchResult {
+        currentCoroutineContext().ensureActive()
+
+        val normalizedQuery = queryStr.trim().lowercase()
+        val normalizedCountry = countryCode?.trim()?.lowercase()?.ifEmpty { null }
+        val cacheKey = CacheKey(normalizedQuery, normalizedCountry)
+
+        // 1. Check in-memory query cache first (no rate limiting, no network IO)
+        val cached = queryCache.get(cacheKey)
+        if (cached != null) {
+            currentCoroutineContext().ensureActive()
+            return cached
+        }
+
+        // 2. Pace outbound HTTP request to satisfy global minimum interval (1 req/sec)
+        paceNominatimRequest()
+        currentCoroutineContext().ensureActive()
+
         val encodedQuery = try {
             URLEncoder.encode(queryStr, "UTF-8")
         } catch (e: Exception) {
             queryStr
         }
 
-        val countryParam = if (!countryCode.isNullOrBlank()) "&countrycodes=$countryCode" else ""
+        val countryParam = if (!normalizedCountry.isNullOrBlank()) "&countrycodes=$normalizedCountry" else ""
         val url = "$baseUrl?q=$encodedQuery&format=json&addressdetails=1&limit=10$countryParam"
 
         val request = Request.Builder()
@@ -276,28 +413,72 @@ class DefaultLocationSearchRepository(
             .get()
             .build()
 
-        val response = try {
-            httpClient.newCall(request).execute()
+        currentCoroutineContext().ensureActive()
+        val call = httpClient.newCall(request)
+
+        val bodyString = try {
+            currentCoroutineContext().ensureActive()
+            suspendCancellableCoroutine<String?> { continuation ->
+                continuation.invokeOnCancellation {
+                    call.cancel()
+                }
+
+                try {
+                    continuation.context.ensureActive()
+                    val body = call.execute().use { response ->
+                        if (response.code == 429) {
+                            throw HttpStatusException(429)
+                        }
+                        if (!response.isSuccessful) {
+                            throw HttpStatusException(response.code)
+                        }
+                        response.body?.string()
+                    }
+
+                    if (call.isCanceled() || !continuation.isActive) {
+                        continuation.cancel(CancellationException("Search call cancelled"))
+                    } else {
+                        continuation.resume(body)
+                    }
+                } catch (e: Throwable) {
+                    if (call.isCanceled() || !continuation.isActive) {
+                        continuation.cancel(e as? CancellationException ?: CancellationException("Search call cancelled", e))
+                    } else {
+                        continuation.resumeWithException(e)
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: HttpStatusException) {
+            if (e.code == 429) {
+                return NominatimFetchResult.RateLimited()
+            }
+            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
         } catch (e: IOException) {
             return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
         } catch (e: Throwable) {
             return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
         }
 
-        if (!response.isSuccessful) {
-            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        currentCoroutineContext().ensureActive()
+
+        val parsedResult = if (bodyString.isNullOrBlank()) {
+            NominatimFetchResult.Empty
+        } else {
+            parseNominatimJson(bodyString)
         }
 
-        val bodyString = try {
-            response.body?.string()
-        } catch (e: Exception) {
-            return NominatimFetchResult.NetworkError("Unable to search locations. Check your internet connection.")
+        // Cache successful and empty results under synchronization.
+        // Do NOT cache NetworkError, Malformed, or cancellations.
+        if (parsedResult is NominatimFetchResult.Success || parsedResult is NominatimFetchResult.Empty) {
+            queryCache.put(cacheKey, parsedResult)
         }
 
-        if (bodyString.isNullOrBlank()) {
-            return NominatimFetchResult.Empty
-        }
+        return parsedResult
+    }
 
+    private fun parseNominatimJson(bodyString: String): NominatimFetchResult {
         val jsonArray = try {
             JSONArray(bodyString)
         } catch (e: Exception) {
@@ -362,6 +543,7 @@ class DefaultLocationSearchRepository(
             is LocationSearchResult.Success -> result.locations
             is LocationSearchResult.Empty -> emptyList()
             is LocationSearchResult.NetworkError -> result.fallbackLocations
+            is LocationSearchResult.RateLimited -> result.fallbackLocations
             is LocationSearchResult.MalformedResponse -> emptyList()
         }
     }
@@ -376,6 +558,9 @@ class DefaultLocationSearchRepository(
 
     companion object {
         const val DEFAULT_BASE_URL = "https://nominatim.openstreetmap.org/search"
+        const val DEFAULT_MIN_REQUEST_INTERVAL_MS: Long = 1000L
+        const val DEFAULT_CACHE_MAX_SIZE: Int = 50
+
         val defaultHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(5, TimeUnit.SECONDS)

@@ -15,6 +15,7 @@ import com.example.network.ValhallaRouteRepository
 import com.example.route.RouteConversionResult
 import com.example.route.SerializedMotoNavRoute
 import com.example.settings.InMemorySettingsRepository
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,6 +50,7 @@ class RouteViewModelTest {
         override val lastError = MutableStateFlow<String?>(null)
 
         var sendTestRouteCalled = false
+        var cancelTransferCalled = false
         var transferSerializedRouteCallCount = 0
         val transferSerializedRouteCalled: Boolean get() = transferSerializedRouteCallCount > 0
         var lastTransferredBinary: ByteArray? = null
@@ -68,7 +70,9 @@ class RouteViewModelTest {
             lastTransferredCrc32 = crc32
         }
 
-        override fun cancelTransfer() {}
+        override fun cancelTransfer() {
+            cancelTransferCalled = true
+        }
         override fun resetError() {
             lastError.value = null
         }
@@ -214,6 +218,13 @@ class RouteViewModelTest {
         assertEquals("Route generation state must be Success", RouteGenerationState.Success, viewModel.routeGenerationState.value)
         assertFalse("isGeneratingRoute must be false after completion", viewModel.isGeneratingRoute.value)
         assertNull("routeGenerationError must be null on success", viewModel.routeGenerationError.value)
+    }
+
+    @Test
+    fun cancelTransferForwardsToBleRepository() {
+        viewModel.cancelTransfer()
+
+        assertTrue("Route cancellation must be forwarded to BLE", fakeBleRepo.cancelTransferCalled)
     }
 
     @Test
@@ -822,6 +833,20 @@ class RouteViewModelTest {
     }
 
     @Test
+    fun testRateLimitedSetsLocationSearchError() = runTest(testDispatcher) {
+        val fallbackList = fakeLocationRepo.popularList
+        fakeLocationRepo.searchHandler = {
+            LocationSearchResult.RateLimited("Search service is temporarily busy. Please wait a moment and try again.", fallbackList)
+        }
+
+        viewModel.searchLocations("Arbitrary Place", debounceMs = 0L)
+        advanceUntilIdle()
+
+        assertEquals("Search service is temporarily busy. Please wait a moment and try again.", viewModel.locationSearchError.value)
+        assertEquals(fallbackList.size, viewModel.locationSearchResults.value.size)
+    }
+
+    @Test
     fun testEmptyResultSetsNoSearchError() = runTest(testDispatcher) {
         fakeLocationRepo.searchHandler = { q ->
             LocationSearchResult.Empty(q)
@@ -851,5 +876,91 @@ class RouteViewModelTest {
         val destSuccess = viewModel.selectDestination(invalidLoc)
         assertFalse("Selecting invalid coordinates should return false", destSuccess)
         assertEquals("Destination coordinates are invalid", viewModel.locationValidationError.value)
+    }
+
+    @Test
+    fun testGenerateRoute_WhenConnectionStateTransferring_RejectsGenerationAndPreservesState() = runTest(testDispatcher) {
+        fakeValhallaRepo.resultToReturn = Result.success(createFakeConversionResult())
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        val stagedGenerated = viewModel.generatedRoute.value
+        assertNotNull("Precondition: GeneratedRouteState must exist", stagedGenerated)
+        val initialFetchCount = fakeValhallaRepo.fetchRouteCallCount
+
+        fakeBleRepo.connectionState.value = ConnectionState.Transferring
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertEquals("Valhalla fetch must NOT be called when transfer is active", initialFetchCount, fakeValhallaRepo.fetchRouteCallCount)
+        assertEquals("Existing GeneratedRouteState must be preserved", stagedGenerated, viewModel.generatedRoute.value)
+        assertEquals("Route generation error must match expected message", "Cannot generate route while transfer is in progress", viewModel.routeGenerationError.value)
+        assertTrue("Route generation state must be RouteGenerationError", viewModel.routeGenerationState.value is RouteGenerationState.RouteGenerationError)
+        assertEquals("Cannot generate route while transfer is in progress", (viewModel.routeGenerationState.value as RouteGenerationState.RouteGenerationError).message)
+    }
+
+    @Test
+    fun testGenerateRoute_WhenTransferProgressIsTransferring_RejectsGenerationAndPreservesState() = runTest(testDispatcher) {
+        fakeValhallaRepo.resultToReturn = Result.success(createFakeConversionResult())
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        val stagedGenerated = viewModel.generatedRoute.value
+        assertNotNull("Precondition: GeneratedRouteState must exist", stagedGenerated)
+        val initialFetchCount = fakeValhallaRepo.fetchRouteCallCount
+
+        fakeBleRepo.connectionState.value = ConnectionState.Connected
+        fakeBleRepo.transferProgress.value = RouteTransferProgress(isTransferring = true, percentage = 50)
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertEquals("Valhalla fetch must NOT be called when transferProgress is active", initialFetchCount, fakeValhallaRepo.fetchRouteCallCount)
+        assertEquals("Existing GeneratedRouteState must be preserved", stagedGenerated, viewModel.generatedRoute.value)
+        assertEquals("Route generation error must match expected message", "Cannot generate route while transfer is in progress", viewModel.routeGenerationError.value)
+        assertTrue("Route generation state must be RouteGenerationError", viewModel.routeGenerationState.value is RouteGenerationState.RouteGenerationError)
+        assertEquals("Cannot generate route while transfer is in progress", (viewModel.routeGenerationState.value as RouteGenerationState.RouteGenerationError).message)
+    }
+
+    @Test
+    fun testGenerateRoute_ConcurrentInvocation_RejectsDuplicateGeneration() = runTest(testDispatcher) {
+        val deferred = CompletableDeferred<Result<RouteConversionResult>>()
+        var fetchCallCount = 0
+        val suspendingValhallaRepo = object : ValhallaRouteRepository() {
+            override suspend fun fetchRoute(
+                origin: RoutePoint,
+                destination: RoutePoint,
+                routeId: Long
+            ): Result<RouteConversionResult> {
+                fetchCallCount++
+                return deferred.await()
+            }
+        }
+
+        val concurrentViewModel = RouteViewModel(
+            routeRepository = sampleRouteRepo,
+            bleRepository = fakeBleRepo,
+            settingsRepository = settingsRepo,
+            valhallaRouteRepository = suspendingValhallaRepo,
+            locationSearchRepository = fakeLocationRepo
+        )
+
+        concurrentViewModel.generateRoute()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("First generation must have initiated exactly one fetch", 1, fetchCallCount)
+        assertTrue("isGeneratingRoute must be true while in flight", concurrentViewModel.isGeneratingRoute.value)
+
+        concurrentViewModel.generateRoute()
+        testDispatcher.scheduler.runCurrent()
+
+        assertEquals("Second call while in flight must NOT initiate another fetch", 1, fetchCallCount)
+
+        deferred.complete(Result.success(createFakeConversionResult()))
+        advanceUntilIdle()
+
+        assertEquals("Total fetch count must remain 1 after completion", 1, fetchCallCount)
+        assertFalse("isGeneratingRoute must be false after completion", concurrentViewModel.isGeneratingRoute.value)
+        assertEquals("Route generation state must be Success", RouteGenerationState.Success, concurrentViewModel.routeGenerationState.value)
+        assertNotNull("Generated route must be set", concurrentViewModel.generatedRoute.value)
     }
 }

@@ -62,6 +62,11 @@ class AndroidBleRepository(
     companion object {
         private const val TAG = "MotoNavBle"
         private const val SCAN_TIMEOUT_MS = 15_000L
+        internal const val REQUESTED_ROUTE_ATT_MTU = 33
+        internal const val ROUTE_DATA_VALUE_SIZE = 30
+
+        internal fun isRouteDataMtuSufficient(attMtu: Int?): Boolean =
+            attMtu != null && attMtu - 3 >= ROUTE_DATA_VALUE_SIZE
     }
 
     private val bluetoothManager: BluetoothManager? =
@@ -87,6 +92,8 @@ class AndroidBleRepository(
     // GATT & Characteristic handles
     @Volatile
     private var bluetoothGatt: BluetoothGatt? = null
+    @Volatile
+    private var negotiatedAttMtu: Int? = null
     private var controlCharacteristic: BluetoothGattCharacteristic? = null
     private var statusCharacteristic: BluetoothGattCharacteristic? = null
     private var routeDataCharacteristic: BluetoothGattCharacteristic? = null
@@ -109,6 +116,12 @@ class AndroidBleRepository(
 
     @Volatile
     private var activeTransferGeneration = 0L
+
+    @Volatile
+    private var cancellingTransferGeneration: Long? = null
+
+    private fun isTransferCancelling(generation: Long): Boolean =
+        cancellingTransferGeneration == generation
 
     // Scanning state & timeout tracking
     private var isScanning = false
@@ -171,6 +184,11 @@ class AndroidBleRepository(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.i(TAG, "Connected to GATT server on MotoNav-01. Initiating service discovery...")
+                    negotiatedAttMtu = null
+                    val mtuRequestStarted = gatt.requestMtu(REQUESTED_ROUTE_ATT_MTU)
+                    if (!mtuRequestStarted) {
+                        Log.w(TAG, "Failed to request ATT MTU $REQUESTED_ROUTE_ATT_MTU")
+                    }
                     _connectionState.value = ConnectionState.Connecting
                     _diagnostics.value = _diagnostics.value.copy(
                         isConnecting = false,
@@ -423,6 +441,7 @@ class AndroidBleRepository(
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (!isActiveGatt(gatt)) return
+            negotiatedAttMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else null
             Log.i(TAG, "onMtuChanged: mtu=$mtu, status=$status")
         }
 
@@ -715,6 +734,7 @@ class AndroidBleRepository(
         stopScan()
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
+        cancellingTransferGeneration = null
         transferJob?.cancel()
         ackSynchronizer.deactivate(generation.takeIf { it != 0L })
         bluetoothGatt?.let { gatt ->
@@ -727,6 +747,7 @@ class AndroidBleRepository(
             }
         }
         bluetoothGatt = null
+        negotiatedAttMtu = null
         controlCharacteristic = null
         statusCharacteristic = null
         routeDataCharacteristic = null
@@ -751,6 +772,7 @@ class AndroidBleRepository(
     private fun disconnectAndCleanup(errorMessage: String?) {
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
+        cancellingTransferGeneration = null
         transferJob?.cancel()
         ackSynchronizer.deactivate(generation.takeIf { it != 0L })
         pendingWriteDeferred?.deferred?.completeExceptionally(CancellationException("GATT disconnected"))
@@ -762,6 +784,7 @@ class AndroidBleRepository(
             Log.e(TAG, "Error closing GATT in cleanup", e)
         }
         bluetoothGatt = null
+        negotiatedAttMtu = null
         controlCharacteristic = null
         statusCharacteristic = null
         routeDataCharacteristic = null
@@ -795,9 +818,12 @@ class AndroidBleRepository(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         data: ByteArray,
-        charDescription: String = characteristic.uuid.toString()
+        charDescription: String = characteristic.uuid.toString(),
+        allowDuringCancellation: Boolean = false
     ): Boolean = writeMutex.withLock {
-        if (activeTransferGeneration != generation) return@withLock false
+        if (activeTransferGeneration != generation ||
+            (!allowDuringCancellation && isTransferCancelling(generation))
+        ) return@withLock false
 
         val deferred = CompletableDeferred<Int>()
         pendingWriteDeferred = PendingWrite(generation, deferred)
@@ -894,6 +920,18 @@ class AndroidBleRepository(
             return
         }
 
+        if (!isRouteDataMtuSufficient(negotiatedAttMtu)) {
+            val err = "Cannot send $actionName: negotiated ATT MTU is unavailable or below $REQUESTED_ROUTE_ATT_MTU (actual=${negotiatedAttMtu ?: "unknown"})"
+            Log.e(TAG, err)
+            _lastError.value = err
+            _connectionState.value = ConnectionState.Error
+            _diagnostics.value = _diagnostics.value.copy(
+                lastError = err,
+                disconnectReconnectState = "Route transfer blocked by insufficient ATT MTU"
+            )
+            return
+        }
+
         val control = controlCharacteristic
         val routeData = routeDataCharacteristic
         val statusChar = statusCharacteristic
@@ -908,6 +946,7 @@ class AndroidBleRepository(
         val hexCrc = "0x${crc32.toString(16).uppercase()}"
         val transferGeneration = nextTransferGeneration.incrementAndGet()
         activeTransferGeneration = transferGeneration
+        cancellingTransferGeneration = null
         val previousTransferJob = transferJob
         previousTransferJob?.cancel()
         _lastError.value = null
@@ -944,6 +983,7 @@ class AndroidBleRepository(
                 val startCmd = TestRouteFixture.buildStartRouteCommand(binary.size)
                 val startOk = writeCharacteristicSuspend(transferGeneration, gatt, control, startCmd, "Control (START_ROUTE)")
                 if (!startOk) {
+                    if (isTransferCancelling(transferGeneration)) return@launch
                     ackSynchronizer.deactivate(transferGeneration)
                     handleTransferError(transferGeneration, "BLE write failure: unable to send START_ROUTE command to Control characteristic")
                     return@launch
@@ -952,7 +992,12 @@ class AndroidBleRepository(
 
                 // 5. Transfer each packet: write -> wait for matching ACK,<sequence>
                 for (packet in packets) {
-                    if (activeTransferGeneration != transferGeneration || _connectionState.value != ConnectionState.Transferring || bluetoothGatt == null) {
+                    if (activeTransferGeneration != transferGeneration ||
+                        isTransferCancelling(transferGeneration) ||
+                        _connectionState.value != ConnectionState.Transferring ||
+                        bluetoothGatt == null
+                    ) {
+                        if (isTransferCancelling(transferGeneration)) return@launch
                         ackSynchronizer.deactivate(transferGeneration)
                         handleTransferError(transferGeneration, "Disconnect occurred during route transfer")
                         return@launch
@@ -961,6 +1006,7 @@ class AndroidBleRepository(
                     Log.i(TAG, "[ROUTE_DATA_WRITE] Writing ROUTE_DATA packet ${packet.sequence} (${packet.payloadLength} B payload, ${packet.framedBytes.size} B framed)...")
                     val writeOk = writeCharacteristicSuspend(transferGeneration, gatt, routeData, packet.framedBytes, "RouteData (packet ${packet.sequence})")
                     if (!writeOk) {
+                        if (isTransferCancelling(transferGeneration)) return@launch
                         ackSynchronizer.deactivate(transferGeneration)
                         handleTransferError(transferGeneration, "BLE write failure on Route Data characteristic for packet ${packet.sequence}")
                         return@launch
@@ -968,8 +1014,10 @@ class AndroidBleRepository(
                     Log.i(TAG, "[ROUTE_DATA_WRITE] Packet ${packet.sequence} write finished. Waiting for ACK,${packet.sequence}...")
 
                     val ackResult = ackSynchronizer.waitForAck(expectedSequence = packet.sequence, timeoutMs = 5000L)
+                    if (isTransferCancelling(transferGeneration)) return@launch
                     when (ackResult) {
                         is AckWaitResult.Success -> {
+                            if (activeTransferGeneration != transferGeneration || isTransferCancelling(transferGeneration)) return@launch
                             Log.i(TAG, "[ACK_WAITER_COMPLETE] Packet ${packet.sequence} acknowledged by MotoNav-01 (raw: '${ackResult.raw}')")
                             val ackedPackets = packet.sequence + 1
                             val percent = ((ackedPackets.toFloat() / totalPackets) * 100).toInt()
@@ -1003,7 +1051,7 @@ class AndroidBleRepository(
                 ackSynchronizer.deactivate(transferGeneration)
 
                 // 6. After all bytes are acknowledged, send END_ROUTE: 02 + uint32 LE CRC
-                if (activeTransferGeneration != transferGeneration) return@launch
+                if (activeTransferGeneration != transferGeneration || isTransferCancelling(transferGeneration)) return@launch
                 _transferProgress.value = RouteTransferProgress(
                     percentage = 100,
                     currentPacket = totalPackets,
@@ -1015,13 +1063,14 @@ class AndroidBleRepository(
                 val endCmd = TestRouteFixture.buildEndRouteCommand(crc32)
                 val endOk = writeCharacteristicSuspend(transferGeneration, gatt, control, endCmd, "Control (END_ROUTE)")
                 if (!endOk) {
+                    if (isTransferCancelling(transferGeneration)) return@launch
                     handleTransferError(transferGeneration, "BLE write failure: unable to send END_ROUTE command to Control characteristic")
                     return@launch
                 }
 
                 // 7. Read/poll Status and require ROUTE_READY
                 Log.i(TAG, "END_ROUTE written. Verifying route status 'ROUTE_READY'...")
-                if (activeTransferGeneration != transferGeneration) return@launch
+                if (activeTransferGeneration != transferGeneration || isTransferCancelling(transferGeneration)) return@launch
                 _transferProgress.value = RouteTransferProgress(
                     percentage = 100,
                     currentPacket = totalPackets,
@@ -1035,16 +1084,18 @@ class AndroidBleRepository(
                     timeoutMs = 6000L
                 )
                 if (verificationEvent is RouteVerificationEvent.Error) {
+                    if (isTransferCancelling(transferGeneration)) return@launch
                     handleTransferError(transferGeneration, "MotoNav-01 reported error during route verification: '${verificationEvent.message}'")
                     return@launch
                 }
                 if (verificationEvent !is RouteVerificationEvent.Ready) {
+                    if (isTransferCancelling(transferGeneration)) return@launch
                     handleTransferError(transferGeneration, "Route verification failed: expected 'ROUTE_READY' but received '${_diagnostics.value.lastStatusMessage ?: "timeout"}'")
                     return@launch
                 }
 
                 // 8. Display transfer progress and final result
-                if (activeTransferGeneration != transferGeneration) return@launch
+                if (activeTransferGeneration != transferGeneration || isTransferCancelling(transferGeneration)) return@launch
                 val readyStatus = _diagnostics.value.lastStatusMessage ?: "ROUTE_READY,${binary.size}/${binary.size}"
                 Log.i(TAG, "Route transfer PASSED! Status: $readyStatus")
                 _connectionState.value = ConnectionState.RouteReady
@@ -1065,6 +1116,7 @@ class AndroidBleRepository(
             } catch (e: Exception) {
                 val err = "Unexpected error during route transfer: ${e.message}"
                 Log.e(TAG, err, e)
+                if (isTransferCancelling(transferGeneration)) return@launch
                 handleTransferError(transferGeneration, err)
             } finally {
                 ackSynchronizer.deactivate(transferGeneration)
@@ -1093,6 +1145,8 @@ class AndroidBleRepository(
         val generation = activeTransferGeneration
         if (generation == 0L || _connectionState.value != ConnectionState.Transferring) return
 
+        cancellingTransferGeneration = generation
+
         val gatt = bluetoothGatt
         val control = controlCharacteristic
         scope.launch {
@@ -1106,7 +1160,8 @@ class AndroidBleRepository(
                     gatt = gatt,
                     characteristic = control,
                     data = byteArrayOf(BleConstants.CMD_CANCEL_ROUTE),
-                    charDescription = "Control (CANCEL_ROUTE)"
+                    charDescription = "Control (CANCEL_ROUTE)",
+                    allowDuringCancellation = true
                 )
             } else {
                 false
@@ -1115,6 +1170,7 @@ class AndroidBleRepository(
             if (activeTransferGeneration != generation) return@launch
 
             activeTransferGeneration = 0L
+            cancellingTransferGeneration = null
             transferJob?.cancel()
             ackSynchronizer.deactivate(generation)
 

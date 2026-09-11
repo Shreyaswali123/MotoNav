@@ -1,6 +1,7 @@
 package com.example.ui.screens.home
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.ble.BleRepository
 import com.example.ble.BleRepositoryProvider
@@ -27,13 +28,22 @@ data class HomeUiState(
 
 class HomeViewModel(
     private val bleRepository: BleRepository = BleRepositoryProvider.instance,
-    private val routeRepository: RouteRepository = SampleRouteRepository.instance,
+    val activeRoute: StateFlow<Route> = SampleRouteRepository.instance.selectedRoute,
     private val settingsRepository: SettingsRepository = InMemorySettingsRepository.instance
 ) : ViewModel() {
 
+    constructor(
+        bleRepository: BleRepository = BleRepositoryProvider.instance,
+        routeRepository: RouteRepository,
+        settingsRepository: SettingsRepository = InMemorySettingsRepository.instance
+    ) : this(
+        bleRepository = bleRepository,
+        activeRoute = routeRepository.selectedRoute,
+        settingsRepository = settingsRepository
+    )
+
     val connectionState: StateFlow<ConnectionState> = bleRepository.connectionState
     val connectedDevice: StateFlow<MotoNavDevice?> = bleRepository.connectedDevice
-    val activeRoute: StateFlow<Route> = routeRepository.selectedRoute
     val unitSystem: StateFlow<UnitSystem> = settingsRepository.preferences
         .map { it.unitSystem }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UnitSystem.KILOMETERS)
@@ -43,6 +53,23 @@ class HomeViewModel(
             bleRepository.connect("MotoNav-01")
         } else {
             bleRepository.disconnect()
+        }
+    }
+
+    companion object {
+        fun provideFactory(
+            bleRepository: BleRepository = BleRepositoryProvider.instance,
+            activeRoute: StateFlow<Route>,
+            settingsRepository: SettingsRepository = InMemorySettingsRepository.instance
+        ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                return HomeViewModel(
+                    bleRepository = bleRepository,
+                    activeRoute = activeRoute,
+                    settingsRepository = settingsRepository
+                ) as T
+            }
         }
     }
 }
