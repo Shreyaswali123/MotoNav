@@ -42,16 +42,20 @@ class AckSynchronizer(
     var isActive: Boolean = false
         private set
 
+    @Volatile
+    private var activeGeneration: Long? = null
+
     /**
      * Activates the notification listener.
      * MUST be called before START_ROUTE to ensure no race condition on packet #0 ACK.
      */
-    fun activate() {
+    fun activate(generation: Long? = null) {
         // Drain any stale messages from channel
         var drainedCount = 0
         while (channel.tryReceive().isSuccess) {
             drainedCount++
         }
+        activeGeneration = generation
         isActive = true
         logger("I", "[ACK_SYNCHRONIZER] Notification listener ACTIVATED (drained $drainedCount stale messages). Ready for route transfer.")
     }
@@ -132,8 +136,13 @@ class AckSynchronizer(
     /**
      * Deactivates the listener and drains any unconsumed messages.
      */
-    fun deactivate() {
+    fun deactivate(generation: Long? = null) {
+        if (generation != null && activeGeneration != generation) {
+            logger("D", "[ACK_SYNCHRONIZER] Ignoring deactivation for stale generation $generation")
+            return
+        }
         isActive = false
+        activeGeneration = null
         var count = 0
         while (channel.tryReceive().isSuccess) {
             count++

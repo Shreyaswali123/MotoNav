@@ -3,8 +3,6 @@ package com.example.ui.screens.device
 import androidx.lifecycle.ViewModel
 import com.example.ble.BleRepository
 import com.example.ble.BleRepositoryProvider
-import com.example.data.RouteRepository
-import com.example.data.SampleRouteRepository
 import com.example.model.BleDiagnostics
 import com.example.model.ConnectionState
 import com.example.model.MotoNavDevice
@@ -12,8 +10,7 @@ import com.example.model.RouteTransferProgress
 import kotlinx.coroutines.flow.StateFlow
 
 class DeviceViewModel(
-    private val bleRepository: BleRepository = BleRepositoryProvider.instance,
-    private val routeRepository: RouteRepository = SampleRouteRepository.instance
+    private val bleRepository: BleRepository = BleRepositoryProvider.instance
 ) : ViewModel() {
 
     val connectionState: StateFlow<ConnectionState> = bleRepository.connectionState
@@ -48,11 +45,6 @@ class DeviceViewModel(
 
     fun cancelTransfer() {
         bleRepository.cancelTransfer()
-    }
-
-    fun simulateRouteTransfer() {
-        val route = routeRepository.selectedRoute.value
-        bleRepository.transferRoute(route)
     }
 
     fun simulateError() {

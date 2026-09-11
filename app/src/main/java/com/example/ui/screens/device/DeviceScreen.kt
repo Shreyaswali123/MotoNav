@@ -1082,43 +1082,21 @@ fun DeviceScreen(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        OutlinedButton(
+                            onClick = { viewModel.simulateError() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .testTag("simulate_error_button"),
+                            shape = RoundedCornerShape(8.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MotoRedError)
                         ) {
-                            OutlinedButton(
-                                onClick = { viewModel.simulateRouteTransfer() },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(44.dp)
-                                    .testTag("simulate_transfer_button"),
-                                shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, MotoAmberPrimary)
-                            ) {
-                                Text(
-                                    text = "Test Transfer",
-                                    color = MotoAmberPrimary,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-
-                            OutlinedButton(
-                                onClick = { viewModel.simulateError() },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(44.dp)
-                                    .testTag("simulate_error_button"),
-                                shape = RoundedCornerShape(8.dp),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, MotoRedError)
-                            ) {
-                                Text(
-                                    text = "Trigger Error",
-                                    color = MotoRedError,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
+                            Text(
+                                text = "Trigger Error",
+                                color = MotoRedError,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }

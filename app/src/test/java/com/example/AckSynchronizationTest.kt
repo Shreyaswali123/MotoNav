@@ -168,4 +168,20 @@ class AckSynchronizationTest {
 
         synchronizer.deactivate()
     }
+
+    @Test
+    fun staleGenerationCannotDeactivateNewOwner() = runTest {
+        val synchronizer = AckSynchronizer(tag = "TestSync")
+        synchronizer.activate(generation = 1L)
+        synchronizer.activate(generation = 2L)
+
+        synchronizer.deactivate(generation = 1L)
+        assertTrue(synchronizer.isActive)
+
+        synchronizer.onNotificationReceived("ACK,2")
+        val result = synchronizer.waitForAck(expectedSequence = 2, timeoutMs = 1000L)
+        assertTrue(result is AckWaitResult.Success)
+
+        synchronizer.deactivate(generation = 2L)
+    }
 }

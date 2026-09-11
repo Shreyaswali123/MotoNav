@@ -49,7 +49,6 @@ class RouteViewModelTest {
         override val lastError = MutableStateFlow<String?>(null)
 
         var sendTestRouteCalled = false
-        var transferRouteCalled = false
         var transferSerializedRouteCallCount = 0
         val transferSerializedRouteCalled: Boolean get() = transferSerializedRouteCallCount > 0
         var lastTransferredBinary: ByteArray? = null
@@ -61,10 +60,6 @@ class RouteViewModelTest {
 
         override fun sendTestRoute() {
             sendTestRouteCalled = true
-        }
-
-        override fun transferRoute(route: Route) {
-            transferRouteCalled = true
         }
 
         override fun transferSerializedRoute(binary: ByteArray, crc32: Long) {
@@ -222,7 +217,7 @@ class RouteViewModelTest {
     }
 
     @Test
-    fun testC_ProductionSendPathDoesNotCallSendTestRouteOrTransferRoute() = runTest(testDispatcher) {
+    fun testC_ProductionSendPathDoesNotCallSendTestRoute() = runTest(testDispatcher) {
         val fakeResult = createFakeConversionResult()
         fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
 
@@ -233,7 +228,6 @@ class RouteViewModelTest {
         advanceUntilIdle()
 
         assertFalse("Production send path must NOT call sendTestRoute()", fakeBleRepo.sendTestRouteCalled)
-        assertFalse("Production send path must NOT call legacy transferRoute()", fakeBleRepo.transferRouteCalled)
     }
 
     @Test
@@ -246,7 +240,6 @@ class RouteViewModelTest {
 
         assertFalse("BLE transferSerializedRoute must NOT be called on Valhalla failure", fakeBleRepo.transferSerializedRouteCalled)
         assertFalse("sendTestRoute must NOT be called on Valhalla failure", fakeBleRepo.sendTestRouteCalled)
-        assertFalse("transferRoute must NOT be called on Valhalla failure", fakeBleRepo.transferRouteCalled)
 
         assertEquals("Route generation error message must be exposed", networkErrorMsg, viewModel.routeGenerationError.value)
         assertTrue("Route generation state must be RouteGenerationError", viewModel.routeGenerationState.value is RouteGenerationState.RouteGenerationError)
@@ -500,7 +493,6 @@ class RouteViewModelTest {
 
         assertFalse("generateRoute() must NOT call BLE transfer", fakeBleRepo.transferSerializedRouteCalled)
         assertFalse("generateRoute() must NOT call sendTestRoute", fakeBleRepo.sendTestRouteCalled)
-        assertFalse("generateRoute() must NOT call transferRoute", fakeBleRepo.transferRouteCalled)
     }
 
     @Test

@@ -23,7 +23,6 @@ interface BleRepository {
     fun readStatus()
     fun sendTestRoute()
     fun transferSerializedRoute(binary: ByteArray, crc32: Long)
-    fun transferRoute(route: Route)
     fun cancelTransfer()
     fun resetError()
     fun simulateError()

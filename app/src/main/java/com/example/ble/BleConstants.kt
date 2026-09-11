@@ -8,6 +8,7 @@ import java.util.UUID
  */
 object BleConstants {
     const val TARGET_DEVICE_NAME = "MotoNav-01"
+    const val CMD_CANCEL_ROUTE: Byte = 0x03
 
     // Custom MotoNav Service UUID
     val SERVICE_UUID: UUID = UUID.fromString("f0debc9a-7856-3412-5678-123412345678")

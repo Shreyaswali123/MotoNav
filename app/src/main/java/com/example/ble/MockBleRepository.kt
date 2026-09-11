@@ -210,21 +210,6 @@ class MockBleRepository(
         )
     }
 
-    override fun transferRoute(route: Route) {
-        if (_connectionState.value != ConnectionState.Connected && _connectionState.value != ConnectionState.RouteReady) {
-            // Auto-connect if needed, then transfer
-            _connectionState.value = ConnectionState.Connecting
-            scope.launch {
-                delay(800)
-                _connectedDevice.value = MotoNavDevice()
-                _connectionState.value = ConnectionState.Connected
-                startTransferSimulation(route)
-            }
-            return
-        }
-        startTransferSimulation(route)
-    }
-
     private fun startTransferSimulation(route: Route) {
         transferJob?.cancel()
         _connectionState.value = ConnectionState.Transferring
