@@ -143,6 +143,7 @@ object TestRouteFixture {
      * 0x01 + uint32 little-endian expected route size
      */
     fun buildStartRouteCommand(expectedSize: Int = EXPECTED_SIZE): ByteArray {
+        require(expectedSize >= 0) { "expectedSize cannot be negative, got $expectedSize" }
         val buffer = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(0x01.toByte())
         buffer.putInt(expectedSize)
@@ -170,14 +171,17 @@ object TestRouteFixture {
      * after payload: packet CRC32 uint32 LE (calculated over header + payload)
      */
     fun frameRouteDataPacket(sequence: Int, payload: ByteArray): ByteArray {
+        require(sequence in 0..65535) { "sequence must be in range 0..65535, got $sequence" }
+        require(payload.size in 0..65535) { "payload.size must be in range 0..65535, got ${payload.size}" }
+
         val headerSize = 6
         val crcSize = 4
         val totalSize = headerSize + payload.size + crcSize
 
         val buffer = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(0x03.toByte())                   // type uint8
-        buffer.putShort(sequence.toShort())        // sequence uint16 LE
-        buffer.putShort(payload.size.toShort())    // payload length uint16 LE
+        buffer.putShort((sequence and 0xFFFF).toShort())        // sequence uint16 LE
+        buffer.putShort((payload.size and 0xFFFF).toShort())    // payload length uint16 LE
         buffer.put(0x00.toByte())                  // flags uint8
 
         buffer.put(payload)                        // payload bytes
@@ -196,6 +200,7 @@ object TestRouteFixture {
         routeBinary: ByteArray = createTestRouteBinary(),
         chunkSize: Int = DEFAULT_PAYLOAD_CHUNK_SIZE
     ): List<FramedPacket> {
+        require(chunkSize > 0) { "chunkSize must be greater than 0, got $chunkSize" }
         val packets = mutableListOf<FramedPacket>()
         var offset = 0
         var sequence = 0

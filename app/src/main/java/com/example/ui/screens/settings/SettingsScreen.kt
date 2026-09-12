@@ -16,29 +16,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AltRoute
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Memory
-import androidx.compose.material.icons.filled.Navigation
-import androidx.compose.material.icons.filled.OpenInBrowser
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.ScreenLockPortrait
 import androidx.compose.material.icons.filled.Straighten
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.TwoWheeler
-import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -59,7 +47,6 @@ import com.example.ui.theme.MotoBackground
 import com.example.ui.theme.MotoCardBorder
 import com.example.ui.theme.MotoCardGradientDiagonal
 import com.example.ui.theme.MotoCyanSecondary
-import com.example.ui.theme.MotoSurface
 import com.example.ui.theme.MotoSurfaceVariant
 import com.example.ui.theme.MotoTextMuted
 import com.example.ui.theme.MotoTextPrimary
@@ -185,83 +172,6 @@ fun SettingsScreen(
                 }
             }
 
-            // Navigation Preferences Section
-            item {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(MotoCardGradientDiagonal)
-                        .border(1.dp, MotoCardBorder, RoundedCornerShape(16.dp))
-                        .testTag("settings_preferences_card")
-                ) {
-                    Column(modifier = Modifier.padding(18.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Tune,
-                                contentDescription = null,
-                                tint = MotoAmberPrimary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = "NAVIGATION PREFERENCES",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = MotoAmberPrimary,
-                                    letterSpacing = 1.sp
-                                )
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        PreferenceToggleRow(
-                            title = "Prefer Twisty & Scenic Routes",
-                            subtitle = "Prioritize curves and backroads over straight expressways",
-                            checked = preferences.preferTwistyRoutes,
-                            onCheckedChange = { viewModel.togglePreferTwistyRoutes(it) }
-                        )
-
-                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MotoCardBorder))
-
-                        PreferenceToggleRow(
-                            title = "Avoid Highways",
-                            subtitle = "Steer route away from tollways and multilane freeways",
-                            checked = preferences.avoidHighways,
-                            onCheckedChange = { viewModel.toggleAvoidHighways(it) }
-                        )
-
-                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MotoCardBorder))
-
-                        PreferenceToggleRow(
-                            title = "Automatic Rerouting",
-                            subtitle = "Recalculate route immediately when missing a maneuver",
-                            checked = preferences.autoReroute,
-                            onCheckedChange = { viewModel.toggleAutoReroute(it) }
-                        )
-
-                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MotoCardBorder))
-
-                        PreferenceToggleRow(
-                            title = "Keep Phone Screen Awake",
-                            subtitle = "Prevent display sleep while planning or mounted on bike",
-                            checked = preferences.keepScreenOn,
-                            onCheckedChange = { viewModel.toggleKeepScreenOn(it) }
-                        )
-
-                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(MotoCardBorder))
-
-                        PreferenceToggleRow(
-                            title = "High-Contrast Cockpit Mode",
-                            subtitle = "OLED pure black theme for bright direct sunlight visibility",
-                            checked = preferences.highContrastCockpitMode,
-                            onCheckedChange = { viewModel.toggleCockpitMode(it) }
-                        )
-                    }
-                }
-            }
-
             // About MotoNav Section
             item {
                 Box(
@@ -363,51 +273,6 @@ private fun UnitOptionButton(
                 )
             )
         }
-    }
-}
-
-@Composable
-private fun PreferenceToggleRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleSmall.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = MotoTextPrimary,
-                    fontSize = 14.sp
-                )
-            )
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodySmall.copy(
-                    color = MotoTextSecondary,
-                    fontSize = 12.sp
-                )
-            )
-        }
-
-        Switch(
-            checked = checked,
-            onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color(0xFF0F1113),
-                checkedTrackColor = MotoAmberPrimary,
-                uncheckedThumbColor = MotoTextSecondary,
-                uncheckedTrackColor = MotoSurfaceVariant
-            )
-        )
     }
 }
 

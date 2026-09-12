@@ -155,8 +155,14 @@ object MotoNavRouteConverter {
 
         // Extract metrics
         val summary = leg.summary ?: trip.summary
-        val totalDistanceMeters = summary?.length?.let { kotlin.math.round(it * 1000.0).toInt() } ?: 0
-        val durationSeconds = summary?.time?.toInt() ?: 0
+        val totalDistanceMeters = summary?.length
+            ?.takeIf { it.isFinite() && it >= 0.0 }
+            ?.let { kotlin.math.round(it * 1000.0).toInt().coerceAtLeast(0) }
+            ?: 0
+        val durationSeconds = summary?.time
+            ?.takeIf { it.isFinite() && it >= 0.0 }
+            ?.let { it.toInt().coerceAtLeast(0) }
+            ?: 0
 
         return RouteConversionResult(
             serializedRoute = serialized,

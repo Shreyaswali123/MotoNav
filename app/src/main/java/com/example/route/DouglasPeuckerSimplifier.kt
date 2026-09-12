@@ -51,7 +51,8 @@ object DouglasPeuckerSimplifier {
         val dLat = lat2 - lat1
         val dLon = lon2 - lon1
         val a = sin(dLat / 2.0).pow(2.0) + cos(lat1) * cos(lat2) * sin(dLon / 2.0).pow(2.0)
-        return 2.0 * EARTH_RADIUS_METERS * asin(sqrt(a))
+        val clampedA = a.coerceIn(0.0, 1.0)
+        return 2.0 * EARTH_RADIUS_METERS * asin(sqrt(clampedA))
     }
 
     /**

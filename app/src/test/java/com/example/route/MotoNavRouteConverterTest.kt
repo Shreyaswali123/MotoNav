@@ -250,4 +250,99 @@ class MotoNavRouteConverterTest {
         assertEquals("Canonical test route fixture must remain exactly 62 bytes", 62, binary.size)
         assertEquals("CRC must remain exactly 0xDC0213B4", 0xDC0213B4L, TestRouteFixture.EXPECTED_CRC)
     }
+
+    @Test
+    fun testNormalPositiveSummaryValuesRemainUnchanged() {
+        val points = listOf(RoutePoint(15.0, 75.0), RoutePoint(15.01, 75.01))
+        val shape = encodePolyline6(points)
+        val response = ValhallaRouteResponse(
+            trip = ValhallaTrip(
+                legs = listOf(
+                    ValhallaLeg(
+                        shape = shape,
+                        summary = ValhallaSummary(length = 26.547, time = 3849.671)
+                    )
+                )
+            )
+        )
+        val result = MotoNavRouteConverter.convert(response)
+        assertEquals(26547, result.totalDistanceMeters)
+        assertEquals(3849, result.durationSeconds)
+    }
+
+    @Test
+    fun testNegativeSummaryMetricsFallBackToZero() {
+        val points = listOf(RoutePoint(15.0, 75.0), RoutePoint(15.01, 75.01))
+        val shape = encodePolyline6(points)
+        val response = ValhallaRouteResponse(
+            trip = ValhallaTrip(
+                legs = listOf(
+                    ValhallaLeg(
+                        shape = shape,
+                        summary = ValhallaSummary(length = -1.5, time = -120.0)
+                    )
+                )
+            )
+        )
+        val result = MotoNavRouteConverter.convert(response)
+        assertEquals(0, result.totalDistanceMeters)
+        assertEquals(0, result.durationSeconds)
+    }
+
+    @Test
+    fun testNaNSummaryMetricsFallBackToZero() {
+        val points = listOf(RoutePoint(15.0, 75.0), RoutePoint(15.01, 75.01))
+        val shape = encodePolyline6(points)
+        val response = ValhallaRouteResponse(
+            trip = ValhallaTrip(
+                legs = listOf(
+                    ValhallaLeg(
+                        shape = shape,
+                        summary = ValhallaSummary(length = Double.NaN, time = Double.NaN)
+                    )
+                )
+            )
+        )
+        val result = MotoNavRouteConverter.convert(response)
+        assertEquals(0, result.totalDistanceMeters)
+        assertEquals(0, result.durationSeconds)
+    }
+
+    @Test
+    fun testPositiveInfinitySummaryMetricsFallBackToZero() {
+        val points = listOf(RoutePoint(15.0, 75.0), RoutePoint(15.01, 75.01))
+        val shape = encodePolyline6(points)
+        val response = ValhallaRouteResponse(
+            trip = ValhallaTrip(
+                legs = listOf(
+                    ValhallaLeg(
+                        shape = shape,
+                        summary = ValhallaSummary(length = Double.POSITIVE_INFINITY, time = Double.POSITIVE_INFINITY)
+                    )
+                )
+            )
+        )
+        val result = MotoNavRouteConverter.convert(response)
+        assertEquals(0, result.totalDistanceMeters)
+        assertEquals(0, result.durationSeconds)
+    }
+
+    @Test
+    fun testNegativeInfinitySummaryMetricsFallBackToZero() {
+        val points = listOf(RoutePoint(15.0, 75.0), RoutePoint(15.01, 75.01))
+        val shape = encodePolyline6(points)
+        val response = ValhallaRouteResponse(
+            trip = ValhallaTrip(
+                legs = listOf(
+                    ValhallaLeg(
+                        shape = shape,
+                        summary = ValhallaSummary(length = Double.NEGATIVE_INFINITY, time = Double.NEGATIVE_INFINITY)
+                    )
+                )
+            )
+        )
+        val result = MotoNavRouteConverter.convert(response)
+        assertEquals(0, result.totalDistanceMeters)
+        assertEquals(0, result.durationSeconds)
+    }
 }

@@ -146,4 +146,54 @@ class DouglasPeuckerSimplifierTest {
         assertEquals(normal.simplifiedPoints, adaptive.simplifiedPoints)
         assertEquals(normal.oldToNewIndexMap, adaptive.oldToNewIndexMap)
     }
+
+    @Test
+    fun testDistanceMetersExactAntipodalPointsDoesNotProduceNaN() {
+        val p1 = RoutePoint(0.0, 0.0)
+        val p2 = RoutePoint(0.0, 180.0)
+        val dist = DouglasPeuckerSimplifier.distanceMeters(p1, p2)
+
+        assertTrue("Antipodal distance must be finite", dist.isFinite())
+        assertTrue("Antipodal distance must not be NaN", !dist.isNaN())
+        val expectedHalfCircumference = Math.PI * 6371000.0
+        assertEquals(expectedHalfCircumference, dist, 100.0)
+
+        val p3 = RoutePoint(-45.0, 0.0)
+        val p4 = RoutePoint(45.0, 180.0)
+        val dist2 = DouglasPeuckerSimplifier.distanceMeters(p3, p4)
+        assertTrue("Antipodal distance 2 must be finite", dist2.isFinite())
+        assertTrue("Antipodal distance 2 must not be NaN", !dist2.isNaN())
+        assertEquals(expectedHalfCircumference, dist2, 100.0)
+    }
+
+    @Test
+    fun testDistanceMetersNearAntipodalPointsDoesNotProduceNaN() {
+        val p1 = RoutePoint(0.0, 0.0)
+        val p2 = RoutePoint(0.0, 179.999999)
+        val dist = DouglasPeuckerSimplifier.distanceMeters(p1, p2)
+
+        assertTrue("Near-antipodal distance must be finite", dist.isFinite())
+        assertTrue("Near-antipodal distance must not be NaN", !dist.isNaN())
+        assertTrue("Near-antipodal distance must be > 20,000 km", dist > 20_000_000.0)
+    }
+
+    @Test
+    fun testDistanceMetersExtremePolarCoordinatesDoesNotProduceNaN() {
+        val northPole = RoutePoint(90.0, 0.0)
+        val southPole = RoutePoint(-90.0, 0.0)
+        val polarDist = DouglasPeuckerSimplifier.distanceMeters(northPole, southPole)
+
+        assertTrue("Polar distance must be finite", polarDist.isFinite())
+        assertTrue("Polar distance must not be NaN", !polarDist.isNaN())
+        val expectedHalfCircumference = Math.PI * 6371000.0
+        assertEquals(expectedHalfCircumference, polarDist, 100.0)
+
+        // North pole to North pole with different longitudes
+        val np1 = RoutePoint(90.0, 0.0)
+        val np2 = RoutePoint(90.0, 180.0)
+        val zeroDist = DouglasPeuckerSimplifier.distanceMeters(np1, np2)
+        assertTrue("Distance between pole representations must be finite", zeroDist.isFinite())
+        assertTrue("Distance between pole representations must not be NaN", !zeroDist.isNaN())
+        assertEquals(0.0, zeroDist, 1e-3)
+    }
 }

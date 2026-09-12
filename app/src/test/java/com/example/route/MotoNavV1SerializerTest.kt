@@ -5,6 +5,7 @@ import com.example.model.RoutePoint
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -126,5 +127,62 @@ class MotoNavV1SerializerTest {
         assertThrows(IllegalArgumentException::class.java) {
             MotoNavV1Serializer.serialize(1L, points, invalidManeuvers)
         }
+    }
+
+    @Test
+    fun testIncreasingManeuverPointIndicesPass() {
+        val points = listOf(
+            RoutePoint(15.0, 75.0),
+            RoutePoint(15.1, 75.1),
+            RoutePoint(15.2, 75.2),
+            RoutePoint(15.3, 75.3)
+        )
+        val maneuvers = listOf(
+            MotoNavManeuverRecord(pointIndex = 0, motoNavType = 1, distanceMeters = 100, valhallaType = 15),
+            MotoNavManeuverRecord(pointIndex = 1, motoNavType = 2, distanceMeters = 200, valhallaType = 10),
+            MotoNavManeuverRecord(pointIndex = 3, motoNavType = 5, distanceMeters = 0, valhallaType = 4)
+        )
+        val result = MotoNavV1Serializer.serialize(1L, points, maneuvers)
+        assertEquals(9 + 4 * 8 + 3 * 7, result.binary.size)
+    }
+
+    @Test
+    fun testEqualManeuverPointIndicesPass() {
+        val points = listOf(
+            RoutePoint(15.0, 75.0),
+            RoutePoint(15.1, 75.1),
+            RoutePoint(15.2, 75.2),
+            RoutePoint(15.3, 75.3)
+        )
+        // Two maneuvers sharing the same pointIndex (e.g. compound turn / roundabout entry and exit)
+        val maneuvers = listOf(
+            MotoNavManeuverRecord(pointIndex = 1, motoNavType = 1, distanceMeters = 50, valhallaType = 15),
+            MotoNavManeuverRecord(pointIndex = 1, motoNavType = 2, distanceMeters = 150, valhallaType = 10),
+            MotoNavManeuverRecord(pointIndex = 3, motoNavType = 5, distanceMeters = 0, valhallaType = 4)
+        )
+        val result = MotoNavV1Serializer.serialize(1L, points, maneuvers)
+        assertEquals(9 + 4 * 8 + 3 * 7, result.binary.size)
+    }
+
+    @Test
+    fun testDecreasingManeuverPointIndicesThrowsIllegalArgumentException() {
+        val points = listOf(
+            RoutePoint(15.0, 75.0),
+            RoutePoint(15.1, 75.1),
+            RoutePoint(15.2, 75.2),
+            RoutePoint(15.3, 75.3)
+        )
+        val invalidManeuvers = listOf(
+            MotoNavManeuverRecord(pointIndex = 2, motoNavType = 1, distanceMeters = 100, valhallaType = 15),
+            MotoNavManeuverRecord(pointIndex = 1, motoNavType = 2, distanceMeters = 200, valhallaType = 10),
+            MotoNavManeuverRecord(pointIndex = 3, motoNavType = 5, distanceMeters = 0, valhallaType = 4)
+        )
+        val ex = assertThrows(IllegalArgumentException::class.java) {
+            MotoNavV1Serializer.serialize(1L, points, invalidManeuvers)
+        }
+        assertTrue(
+            "Exception message must mention pointIndex is less than previous: ${ex.message}",
+            ex.message?.contains("is less than previous maneuver") == true
+        )
     }
 }

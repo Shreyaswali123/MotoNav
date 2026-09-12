@@ -901,7 +901,36 @@ class AndroidBleRepository(
 
     private fun transferBinary(binary: ByteArray, crc32: Long, isTestRoute: Boolean = false) {
         val actionName = if (isTestRoute) "test route" else "route"
-        // 2. Verify BLE is connected before starting
+
+        // 1. Boundary validation: reject payloads below minimum header size (9 bytes)
+        if (binary.size < 9) {
+            val err = "Cannot send $actionName: route binary size (${binary.size} bytes) is below minimum header size (9 bytes)"
+            Log.e(TAG, err)
+            _lastError.value = err
+            _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            return
+        }
+
+        // 2. CRC range validation: reject values outside unsigned 32-bit range (0L..0xFFFFFFFFL)
+        if (crc32 !in 0L..0xFFFFFFFFL) {
+            val err = "Cannot send $actionName: CRC32 ($crc32) is outside valid 32-bit unsigned range (0..0xFFFFFFFF)"
+            Log.e(TAG, err)
+            _lastError.value = err
+            _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            return
+        }
+
+        // 3. CRC sanity validation: reject if supplied CRC does not match calculated binary CRC32
+        val calculatedCrc = TestRouteFixture.calculateCrc32(binary)
+        if (calculatedCrc != crc32) {
+            val err = "Cannot send $actionName: CRC mismatch (provided 0x${crc32.toString(16).uppercase()}, calculated 0x${calculatedCrc.toString(16).uppercase()})"
+            Log.e(TAG, err)
+            _lastError.value = err
+            _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            return
+        }
+
+        // 4. Verify BLE is connected before starting
         val gatt = bluetoothGatt
         if (gatt == null || (_connectionState.value != ConnectionState.Connected && _connectionState.value != ConnectionState.RouteReady)) {
             val err = "Cannot send $actionName: MotoNav-01 is not connected"

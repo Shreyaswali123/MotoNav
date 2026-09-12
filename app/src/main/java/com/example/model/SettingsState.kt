@@ -6,12 +6,7 @@ enum class UnitSystem(val label: String) {
 }
 
 data class NavigationPreferences(
-    val unitSystem: UnitSystem = UnitSystem.KILOMETERS,
-    val avoidHighways: Boolean = false,
-    val preferTwistyRoutes: Boolean = true,
-    val autoReroute: Boolean = true,
-    val keepScreenOn: Boolean = true,
-    val highContrastCockpitMode: Boolean = true
+    val unitSystem: UnitSystem = UnitSystem.KILOMETERS
 )
 
 data class AboutMotoNavInfo(

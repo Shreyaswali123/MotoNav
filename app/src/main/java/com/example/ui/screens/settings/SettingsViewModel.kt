@@ -18,24 +18,4 @@ class SettingsViewModel(
     fun setUnitSystem(unitSystem: UnitSystem) {
         settingsRepository.setUnitSystem(unitSystem)
     }
-
-    fun toggleAvoidHighways(enabled: Boolean) {
-        settingsRepository.toggleAvoidHighways(enabled)
-    }
-
-    fun togglePreferTwistyRoutes(enabled: Boolean) {
-        settingsRepository.togglePreferTwistyRoutes(enabled)
-    }
-
-    fun toggleAutoReroute(enabled: Boolean) {
-        settingsRepository.toggleAutoReroute(enabled)
-    }
-
-    fun toggleKeepScreenOn(enabled: Boolean) {
-        settingsRepository.toggleKeepScreenOn(enabled)
-    }
-
-    fun toggleCockpitMode(enabled: Boolean) {
-        settingsRepository.toggleCockpitMode(enabled)
-    }
 }

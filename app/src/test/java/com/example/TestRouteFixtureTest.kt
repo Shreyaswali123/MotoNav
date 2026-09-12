@@ -239,4 +239,77 @@ class TestRouteFixtureTest {
         assertTrue("Dynamic route transfer should complete and reach RouteReady", routeReady)
         assertEquals("ROUTE_READY,100/100", mockRepo.connectedDevice.value?.rawStatus)
     }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testCreateRouteDataPacketsChunkSizeZeroFails() {
+        TestRouteFixture.createRouteDataPackets(chunkSize = 0)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testCreateRouteDataPacketsNegativeChunkSizeFails() {
+        TestRouteFixture.createRouteDataPackets(chunkSize = -1)
+    }
+
+    @Test
+    fun testFrameRouteDataPacketSequenceZeroSucceeds() {
+        val payload = byteArrayOf(0x01, 0x02)
+        val packet = TestRouteFixture.frameRouteDataPacket(0, payload)
+        val buf = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0x03.toByte(), buf.get()) // type
+        val seq = buf.short.toInt() and 0xFFFF
+        assertEquals(0, seq)
+    }
+
+    @Test
+    fun testFrameRouteDataPacketSequence65535Succeeds() {
+        val payload = byteArrayOf(0x01, 0x02)
+        val packet = TestRouteFixture.frameRouteDataPacket(65535, payload)
+        val buf = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0x03.toByte(), buf.get()) // type
+        val seq = buf.short.toInt() and 0xFFFF
+        assertEquals(65535, seq)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testFrameRouteDataPacketSequence65536Fails() {
+        TestRouteFixture.frameRouteDataPacket(65536, byteArrayOf(0x01))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testFrameRouteDataPacketNegativeSequenceFails() {
+        TestRouteFixture.frameRouteDataPacket(-1, byteArrayOf(0x01))
+    }
+
+    @Test
+    fun testFrameRouteDataPacketPayloadLength65535Succeeds() {
+        val largePayload = ByteArray(65535)
+        val packet = TestRouteFixture.frameRouteDataPacket(1, largePayload)
+        val buf = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(0x03.toByte(), buf.get()) // type
+        buf.short // seq
+        val len = buf.short.toInt() and 0xFFFF
+        assertEquals(65535, len)
+        assertEquals(6 + 65535 + 4, packet.size)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testFrameRouteDataPacketPayloadLengthGreaterThan65535Fails() {
+        val oversizedPayload = ByteArray(65536)
+        TestRouteFixture.frameRouteDataPacket(1, oversizedPayload)
+    }
+
+    @Test
+    fun testBuildStartRouteCommandExpectedSizeZeroSucceeds() {
+        val cmd = TestRouteFixture.buildStartRouteCommand(0)
+        assertEquals(5, cmd.size)
+        assertEquals(0x01.toByte(), cmd[0])
+        val buf = ByteBuffer.wrap(cmd).order(ByteOrder.LITTLE_ENDIAN)
+        buf.get() // opcode
+        assertEquals(0, buf.int)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testBuildStartRouteCommandNegativeExpectedSizeFails() {
+        TestRouteFixture.buildStartRouteCommand(-1)
+    }
 }

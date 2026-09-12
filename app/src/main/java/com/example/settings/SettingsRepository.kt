@@ -12,11 +12,6 @@ interface SettingsRepository {
     val preferences: StateFlow<NavigationPreferences>
     val aboutInfo: AboutMotoNavInfo
     fun setUnitSystem(unitSystem: UnitSystem)
-    fun toggleAvoidHighways(enabled: Boolean)
-    fun togglePreferTwistyRoutes(enabled: Boolean)
-    fun toggleAutoReroute(enabled: Boolean)
-    fun toggleKeepScreenOn(enabled: Boolean)
-    fun toggleCockpitMode(enabled: Boolean)
 }
 
 class InMemorySettingsRepository : SettingsRepository {
@@ -28,26 +23,6 @@ class InMemorySettingsRepository : SettingsRepository {
 
     override fun setUnitSystem(unitSystem: UnitSystem) {
         _preferences.update { it.copy(unitSystem = unitSystem) }
-    }
-
-    override fun toggleAvoidHighways(enabled: Boolean) {
-        _preferences.update { it.copy(avoidHighways = enabled) }
-    }
-
-    override fun togglePreferTwistyRoutes(enabled: Boolean) {
-        _preferences.update { it.copy(preferTwistyRoutes = enabled) }
-    }
-
-    override fun toggleAutoReroute(enabled: Boolean) {
-        _preferences.update { it.copy(autoReroute = enabled) }
-    }
-
-    override fun toggleKeepScreenOn(enabled: Boolean) {
-        _preferences.update { it.copy(keepScreenOn = enabled) }
-    }
-
-    override fun toggleCockpitMode(enabled: Boolean) {
-        _preferences.update { it.copy(highContrastCockpitMode = enabled) }
     }
 
     companion object {

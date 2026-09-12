@@ -113,7 +113,15 @@ object MotoNavV1Serializer {
             require(m.distanceMeters >= 0) {
                 "Maneuver $idx distance ${m.distanceMeters} must be non-negative"
             }
+        }
 
+        for (i in 1 until maneuvers.size) {
+            require(maneuvers[i].pointIndex >= maneuvers[i - 1].pointIndex) {
+                "Maneuver $i pointIndex (${maneuvers[i].pointIndex}) is less than previous maneuver (${maneuvers[i - 1].pointIndex})"
+            }
+        }
+
+        for (m in maneuvers) {
             buffer.putShort((m.pointIndex and 0xFFFF).toShort())
             buffer.put(m.motoNavType)
             buffer.putInt(m.distanceMeters)
