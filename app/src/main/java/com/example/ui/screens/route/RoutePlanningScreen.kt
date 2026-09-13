@@ -971,7 +971,7 @@ fun RoutePlanningScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "From: ${startLocation?.name ?: selectedRoute.startLocation.name ?: "Select Start Point"}",
+                                text = "From: ${startLocation?.name ?: selectedRoute.startLocation?.name ?: "Select Start Point"}",
                                 style = MaterialTheme.typography.bodySmall.copy(
                                     color = MotoTextSecondary,
                                     fontSize = 12.sp
@@ -1005,7 +1005,7 @@ fun RoutePlanningScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "To: ${destination?.name ?: selectedRoute.destination.name ?: "Select Destination"}",
+                                text = "To: ${destination?.name ?: selectedRoute.destination?.name ?: "Select Destination"}",
                                 style = MaterialTheme.typography.bodySmall.copy(
                                     color = MotoTextPrimary,
                                     fontWeight = FontWeight.SemiBold,

@@ -12,9 +12,11 @@ import com.example.model.Route
 import com.example.model.RoutePoint
 import com.example.model.RouteTransferProgress
 import com.example.network.ValhallaRouteRepository
+import com.example.route.MotoNavManeuverRecord
 import com.example.route.RouteConversionResult
 import com.example.route.SerializedMotoNavRoute
 import com.example.settings.InMemorySettingsRepository
+import com.example.ui.components.RouteMapAdapter
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -164,7 +166,8 @@ class RouteViewModelTest {
 
     private fun createFakeConversionResult(
         binary: ByteArray = byteArrayOf(0x4D, 0x4E, 0x56, 0x31, 0x01, 0x02, 0x03),
-        crc32: Long = 0xA1B2C3D4L
+        crc32: Long = 0xA1B2C3D4L,
+        maneuvers: List<MotoNavManeuverRecord> = emptyList()
     ): RouteConversionResult {
         return RouteConversionResult(
             serializedRoute = SerializedMotoNavRoute(
@@ -179,7 +182,7 @@ class RouteViewModelTest {
                 RoutePoint(37.7749, -122.4194),
                 RoutePoint(37.8920, -122.5650)
             ),
-            maneuvers = emptyList(),
+            maneuvers = maneuvers,
             totalDistanceMeters = 42800,
             durationSeconds = 3120
         )
@@ -348,6 +351,45 @@ class RouteViewModelTest {
     }
 
     @Test
+    fun testClearingStartLocationClearsSelectedRouteEndpointAndOriginMarker() = runTest(testDispatcher) {
+        val destinationBeforeClear = viewModel.destination.value
+        fakeValhallaRepo.resultToReturn = Result.success(
+            createFakeConversionResult(
+                maneuvers = listOf(
+                    MotoNavManeuverRecord(
+                        pointIndex = 0,
+                        motoNavType = 1,
+                        distanceMeters = 100,
+                        valhallaType = 15
+                    )
+                )
+            )
+        )
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertTrue("Precondition: generated route must contain geometry", viewModel.selectedRoute.value.waypoints.isNotEmpty())
+        assertTrue("Precondition: generated route must contain maneuvers", viewModel.selectedRoute.value.maneuvers.isNotEmpty())
+        assertNotNull("Precondition: generated route state must exist", viewModel.generatedRoute.value)
+
+        viewModel.clearStartLocation()
+        advanceUntilIdle()
+
+        val clearedRoute = viewModel.selectedRoute.value
+        assertNull(viewModel.startLocation.value)
+        assertNull(clearedRoute.startLocation)
+        assertEquals(destinationBeforeClear, clearedRoute.destination)
+        assertTrue(clearedRoute.waypoints.isEmpty())
+        assertTrue(clearedRoute.maneuvers.isEmpty())
+        assertEquals(0, clearedRoute.totalDistanceMeters)
+        assertEquals(0, clearedRoute.estimatedDurationSeconds)
+        assertNull(viewModel.generatedRoute.value)
+        assertFalse(viewModel.isSendRouteEnabled.value)
+        assertNull(RouteMapAdapter.extractOriginMarker(clearedRoute.startLocation))
+    }
+
+    @Test
     fun testClearingDestinationDisablesSendRoute() = runTest(testDispatcher) {
         viewModel.clearDestination()
         advanceUntilIdle()
@@ -355,6 +397,45 @@ class RouteViewModelTest {
         assertNull("destination should be null after clearing", viewModel.destination.value)
         assertFalse("isGenerateRouteEnabled must be false when destination is null", viewModel.isGenerateRouteEnabled.value)
         assertFalse("isSendRouteEnabled must be false when destination is null", viewModel.isSendRouteEnabled.value)
+    }
+
+    @Test
+    fun testClearingDestinationClearsSelectedRouteEndpointAndDestinationMarker() = runTest(testDispatcher) {
+        val startBeforeClear = viewModel.startLocation.value
+        fakeValhallaRepo.resultToReturn = Result.success(
+            createFakeConversionResult(
+                maneuvers = listOf(
+                    MotoNavManeuverRecord(
+                        pointIndex = 0,
+                        motoNavType = 1,
+                        distanceMeters = 100,
+                        valhallaType = 15
+                    )
+                )
+            )
+        )
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+
+        assertTrue("Precondition: generated route must contain geometry", viewModel.selectedRoute.value.waypoints.isNotEmpty())
+        assertTrue("Precondition: generated route must contain maneuvers", viewModel.selectedRoute.value.maneuvers.isNotEmpty())
+        assertNotNull("Precondition: generated route state must exist", viewModel.generatedRoute.value)
+
+        viewModel.clearDestination()
+        advanceUntilIdle()
+
+        val clearedRoute = viewModel.selectedRoute.value
+        assertNull(viewModel.destination.value)
+        assertNull(clearedRoute.destination)
+        assertEquals(startBeforeClear, clearedRoute.startLocation)
+        assertTrue(clearedRoute.waypoints.isEmpty())
+        assertTrue(clearedRoute.maneuvers.isEmpty())
+        assertEquals(0, clearedRoute.totalDistanceMeters)
+        assertEquals(0, clearedRoute.estimatedDurationSeconds)
+        assertNull(viewModel.generatedRoute.value)
+        assertFalse(viewModel.isSendRouteEnabled.value)
+        assertNull(RouteMapAdapter.extractDestinationMarker(clearedRoute.destination))
     }
 
     @Test

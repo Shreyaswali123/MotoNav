@@ -191,7 +191,7 @@ class HomeViewModelTest {
         assertTrue("Waypoints must be empty after invalidation", homeRoute.waypoints.isEmpty())
         assertEquals("Distance must be 0 after invalidation", 0, homeRoute.totalDistanceMeters)
         assertEquals("Duration must be 0 after invalidation", 0, homeRoute.estimatedDurationSeconds)
-        assertEquals("Fisherman's Wharf", homeRoute.startLocation.name)
+        assertEquals("Fisherman's Wharf", homeRoute.startLocation?.name)
     }
 
     @Test
@@ -215,7 +215,7 @@ class HomeViewModelTest {
         assertTrue("Waypoints must be empty after invalidation", homeRoute.waypoints.isEmpty())
         assertEquals("Distance must be 0 after invalidation", 0, homeRoute.totalDistanceMeters)
         assertEquals("Duration must be 0 after invalidation", 0, homeRoute.estimatedDurationSeconds)
-        assertEquals("Marin Headlands", homeRoute.destination.name)
+        assertEquals("Marin Headlands", homeRoute.destination?.name)
     }
 
     @Test

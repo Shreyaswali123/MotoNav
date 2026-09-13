@@ -4,6 +4,7 @@ import com.example.model.RoutePoint
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RouteMapAdapterTest {
@@ -214,5 +215,110 @@ class RouteMapAdapterTest {
         assertEquals("Same geometry produces identical signature", sig1, sig1Again)
         assert(sig1 != sig2) { "Different waypoints must produce different signature" }
         assert(sig1 != sigDifferentId) { "Different route id must produce different signature" }
+    }
+
+    @Test
+    fun testIdenticalCompleteRouteGeometryProducesSameSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val intermediate = RoutePoint(15.20, 75.20)
+        val destination = RoutePoint(15.30, 75.30)
+        val waypoints = listOf(origin, intermediate, destination)
+
+        val first = RouteMapAdapter.computeRouteSignature("route_1", origin, destination, waypoints)
+        val second = RouteMapAdapter.computeRouteSignature(
+            "route_1",
+            origin.copy(),
+            destination.copy(),
+            waypoints.map { it.copy() }
+        )
+
+        assertEquals(first, second)
+    }
+
+    @Test
+    fun testChangingOnlyIntermediateWaypointChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val destination = RoutePoint(15.30, 75.30)
+        val original = listOf(origin, RoutePoint(15.20, 75.20), destination)
+        val changed = listOf(origin, RoutePoint(15.21, 75.21), destination)
+
+        val originalSignature = RouteMapAdapter.computeRouteSignature("route_1", origin, destination, original)
+        val changedSignature = RouteMapAdapter.computeRouteSignature("route_1", origin, destination, changed)
+
+        assertTrue(originalSignature != changedSignature)
+    }
+
+    @Test
+    fun testChangingFirstWaypointChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val destination = RoutePoint(15.30, 75.30)
+        val original = listOf(origin, RoutePoint(15.20, 75.20), destination)
+        val changed = listOf(RoutePoint(15.11, 75.11), RoutePoint(15.20, 75.20), destination)
+
+        assertTrue(
+            RouteMapAdapter.computeRouteSignature("route_1", origin, destination, original) !=
+                RouteMapAdapter.computeRouteSignature("route_1", origin, destination, changed)
+        )
+    }
+
+    @Test
+    fun testChangingLastWaypointChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val destination = RoutePoint(15.30, 75.30)
+        val original = listOf(origin, RoutePoint(15.20, 75.20), destination)
+        val changed = listOf(origin, RoutePoint(15.20, 75.20), RoutePoint(15.31, 75.31))
+
+        assertTrue(
+            RouteMapAdapter.computeRouteSignature("route_1", origin, destination, original) !=
+                RouteMapAdapter.computeRouteSignature("route_1", origin, destination, changed)
+        )
+    }
+
+    @Test
+    fun testChangingStartCoordinateChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val changedOrigin = RoutePoint(15.11, 75.11)
+        val destination = RoutePoint(15.30, 75.30)
+        val waypoints = listOf(origin, RoutePoint(15.20, 75.20), destination)
+
+        assertTrue(
+            RouteMapAdapter.computeRouteSignature("route_1", origin, destination, waypoints) !=
+                RouteMapAdapter.computeRouteSignature("route_1", changedOrigin, destination, waypoints)
+        )
+    }
+
+    @Test
+    fun testChangingDestinationCoordinateChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val destination = RoutePoint(15.30, 75.30)
+        val changedDestination = RoutePoint(15.31, 75.31)
+        val waypoints = listOf(origin, RoutePoint(15.20, 75.20), destination)
+
+        assertTrue(
+            RouteMapAdapter.computeRouteSignature("route_1", origin, destination, waypoints) !=
+                RouteMapAdapter.computeRouteSignature("route_1", origin, changedDestination, waypoints)
+        )
+    }
+
+    @Test
+    fun testChangingRouteIdChangesSignature() {
+        val origin = RoutePoint(15.10, 75.10)
+        val destination = RoutePoint(15.30, 75.30)
+        val waypoints = listOf(origin, RoutePoint(15.20, 75.20), destination)
+
+        assertTrue(
+            RouteMapAdapter.computeRouteSignature("route_1", origin, destination, waypoints) !=
+                RouteMapAdapter.computeRouteSignature("route_2", origin, destination, waypoints)
+        )
+    }
+
+    @Test
+    fun testRouteSignaturePreservesNullAndEmptyGeometryBehavior() {
+        assertNull(RouteMapAdapter.computeRouteSignature(null, null, null, null))
+        assertNull(RouteMapAdapter.computeRouteSignature(null, null, null, emptyList()))
+        assertEquals(
+            RouteMapAdapter.computeRouteSignature("route_1", null, null, null),
+            RouteMapAdapter.computeRouteSignature("route_1", null, null, emptyList())
+        )
     }
 }

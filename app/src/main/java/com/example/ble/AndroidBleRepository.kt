@@ -32,13 +32,372 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
+import java.util.ArrayDeque
+import java.util.UUID
+
+internal enum class GattOperationKind {
+    MTU,
+    RSSI,
+    SERVICE_DISCOVERY,
+    DESCRIPTOR_WRITE,
+    CHARACTERISTIC_READ,
+    CHARACTERISTIC_WRITE
+}
+
+internal data class GattOperationToken(
+    val operationId: Long,
+    val epoch: Long,
+    val gattIdentity: Any,
+    val kind: GattOperationKind,
+    val targetIdentity: Any?,
+    val targetUuid: UUID?,
+    val transferGeneration: Long?
+)
+
+internal data class GattOperationResult(
+    val status: Int,
+    val mtu: Int? = null,
+    val rssi: Int? = null,
+    val value: ByteArray? = null
+)
+
+internal class GattOperationStartException(message: String) : Exception(message)
+internal class GattOperationTimeoutException(message: String) : Exception(message)
+internal class GattOperationInvalidatedException(message: String) : Exception(message)
+
+/**
+ * Serializes Android's callback-based BluetoothGatt operations without holding
+ * a lock while waiting for a callback. A queue instance belongs to one GATT
+ * object and one connection epoch only.
+ */
+internal class GattOperationQueue(
+    internal val gattIdentity: Any,
+    internal val epoch: Long,
+    private val scope: CoroutineScope,
+    private val onTimeout: (GattOperationToken) -> Unit,
+    private val onCancellation: (GattOperationToken) -> Unit = {}
+) {
+    private data class Request(
+        val token: GattOperationToken,
+        val timeoutMs: Long,
+        val completion: CompletableDeferred<GattOperationResult>,
+        val start: (GattOperationToken) -> Boolean
+    )
+
+    private data class Active(
+        val request: Request,
+        var timeoutJob: Job? = null
+    )
+
+    private val lock = Any()
+    private val pending = ArrayDeque<Request>()
+    private var active: Active? = null
+    private var closed = false
+    private var nextOperationId = 0L
+
+    suspend fun execute(
+        kind: GattOperationKind,
+        targetIdentity: Any? = null,
+        targetUuid: UUID? = null,
+        transferGeneration: Long? = null,
+        timeoutMs: Long = 5_000L,
+        start: (GattOperationToken) -> Boolean
+    ): GattOperationResult {
+        val completion = CompletableDeferred<GattOperationResult>()
+        val request: Request
+        var startNow = false
+
+        synchronized(lock) {
+            if (closed) {
+                throw GattOperationInvalidatedException("GATT operation queue is closed")
+            }
+
+            val token = GattOperationToken(
+                operationId = ++nextOperationId,
+                epoch = epoch,
+                gattIdentity = gattIdentity,
+                kind = kind,
+                targetIdentity = targetIdentity,
+                targetUuid = targetUuid,
+                transferGeneration = transferGeneration
+            )
+            request = Request(token, timeoutMs, completion, start)
+            pending.addLast(request)
+            if (active == null) {
+                active = Active(pending.removeFirst())
+                startNow = true
+            }
+        }
+
+        if (startNow) {
+            scheduleStart(activeRequest())
+        }
+
+        return try {
+            completion.await()
+        } catch (e: CancellationException) {
+            val activeRequest = synchronized(lock) {
+                active?.request?.token == request.token
+            }
+            if (activeRequest) {
+                invalidate(e)
+                onCancellation(request.token)
+            }
+            throw e
+        }
+    }
+
+    fun matches(
+        kind: GattOperationKind,
+        targetIdentity: Any? = null,
+        targetUuid: UUID? = null
+    ): Boolean = synchronized(lock) {
+        val current = active?.request?.token ?: return@synchronized false
+        current.kind == kind &&
+            current.targetIdentity === targetIdentity &&
+            current.targetUuid == targetUuid &&
+            !closed
+    }
+
+    fun complete(
+        kind: GattOperationKind,
+        targetIdentity: Any? = null,
+        targetUuid: UUID? = null,
+        result: GattOperationResult,
+        callbackGattIdentity: Any = gattIdentity
+    ): Boolean {
+        val token = synchronized(lock) {
+            active?.request?.token?.takeIf {
+                it.gattIdentity === callbackGattIdentity &&
+                it.kind == kind &&
+                    it.targetIdentity === targetIdentity &&
+                    it.targetUuid == targetUuid &&
+                    !closed
+            }
+        } ?: return false
+
+        finish(token, result, null)
+        return true
+    }
+
+    fun invalidate(cause: Throwable = GattOperationInvalidatedException("GATT operation queue invalidated")) {
+        val requests = synchronized(lock) {
+            if (closed) return
+            closed = true
+            val invalidated = ArrayList<Request>(pending.size + 1)
+            active?.let { invalidated.add(it.request) }
+            invalidated.addAll(pending)
+            active?.timeoutJob?.cancel()
+            active = null
+            pending.clear()
+            invalidated
+        }
+        requests.forEach { it.completion.completeExceptionally(cause) }
+    }
+
+    private fun activeRequest(): Request? = synchronized(lock) { active?.request }
+
+    private fun scheduleStart(request: Request?) {
+        if (request == null) return
+        scope.launch { start(request) }
+    }
+
+    private fun start(request: Request) {
+        val canStart = synchronized(lock) {
+            !closed && active?.request?.token == request.token
+        }
+
+        if (!canStart) return
+
+        val initiated = try {
+            request.start(request.token)
+        } catch (_: Throwable) {
+            false
+        }
+
+        when (initiated) {
+            false -> finish(
+                request.token,
+                null,
+                GattOperationStartException("Failed to start ${request.token.kind} operation")
+            )
+            true -> {
+                val timeoutJob = scope.launch {
+                    kotlinx.coroutines.delay(request.timeoutMs)
+                    timeout(request.token)
+                }
+                synchronized(lock) {
+                    if (active?.request?.token == request.token && !closed) {
+                        active?.timeoutJob = timeoutJob
+                    } else {
+                        timeoutJob.cancel()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun finish(
+        token: GattOperationToken,
+        result: GattOperationResult?,
+        failure: Throwable?
+    ) {
+        var completed: Request? = null
+        var next: Request? = null
+
+        synchronized(lock) {
+            val current = active ?: return
+            if (current.request.token != token || closed) return
+            current.timeoutJob?.cancel()
+            active = null
+            completed = current.request
+            if (pending.isNotEmpty()) {
+                next = pending.removeFirst()
+                active = Active(next!!)
+            }
+        }
+
+        completed?.let {
+            if (failure != null) it.completion.completeExceptionally(failure)
+            else it.completion.complete(result ?: GattOperationResult(status = -1))
+        }
+        scheduleStart(next)
+    }
+
+    private fun timeout(token: GattOperationToken) {
+        val requests = synchronized(lock) {
+            val current = active ?: return
+            if (current.request.token != token || closed) return
+            closed = true
+            current.timeoutJob?.cancel()
+            val timedOut = ArrayList<Request>(pending.size + 1)
+            timedOut.add(current.request)
+            timedOut.addAll(pending)
+            active = null
+            pending.clear()
+            timedOut
+        }
+
+        requests.firstOrNull()?.completion?.completeExceptionally(
+            GattOperationTimeoutException("Timed out waiting for ${token.kind} callback")
+        )
+        requests.drop(1).forEach {
+            it.completion.completeExceptionally(
+                GattOperationInvalidatedException("GATT operation queue closed after timeout")
+            )
+        }
+        onTimeout(token)
+    }
+
+}
+
+private fun Boolean?.orFalse(): Boolean = this == true
+
+/** Owns scan-attempt identity independently from the GATT connection epoch. */
+internal class ScanAttemptCoordinator {
+    private val lock = Any()
+    private var nextGeneration = 0L
+    private var activeGeneration: Long? = null
+
+    fun begin(): Long = synchronized(lock) {
+        val generation = ++nextGeneration
+        activeGeneration = generation
+        generation
+    }
+
+    fun isCurrent(generation: Long): Boolean = synchronized(lock) {
+        activeGeneration == generation
+    }
+
+    fun claim(generation: Long): Boolean = synchronized(lock) {
+        if (activeGeneration != generation) return@synchronized false
+        activeGeneration = null
+        true
+    }
+
+    fun invalidate(generation: Long? = null) = synchronized(lock) {
+        if (generation == null || activeGeneration == generation) {
+            activeGeneration = null
+        }
+    }
+
+    fun currentGeneration(): Long? = synchronized(lock) { activeGeneration }
+}
+
+/** Filters transfer-specific status messages after a local cancellation boundary. */
+internal class StatusNotificationGate {
+    private var postCancellationBoundary = false
+
+    fun markTransferStarted() {
+        postCancellationBoundary = false
+    }
+
+    fun markTransferCancelled() {
+        postCancellationBoundary = true
+    }
+
+    fun resetConnection() {
+        postCancellationBoundary = false
+    }
+
+    fun shouldForward(rawStatus: String): Boolean {
+        if (!postCancellationBoundary) return true
+        val verb = rawStatus.trim().substringBefore(',').uppercase()
+        return verb == "IDLE"
+    }
+
+    fun isPostCancellationBoundaryActive(): Boolean = postCancellationBoundary
+}
+
+/** Owns the local terminal boundary for the currently active transfer generation. */
+internal class TransferTerminalBoundary {
+    private var activeGeneration: Long? = null
+    private var terminal = false
+
+    fun begin(generation: Long) {
+        activeGeneration = generation
+        terminal = false
+    }
+
+    fun terminate(generation: Long): Boolean {
+        if (activeGeneration != generation) return false
+        activeGeneration = null
+        terminal = true
+        return true
+    }
+
+    fun reset() {
+        activeGeneration = null
+        terminal = false
+    }
+
+    fun shouldForward(rawStatus: String): Boolean {
+        if (!terminal) return true
+        return rawStatus.trim().substringBefore(',').uppercase() == "IDLE"
+    }
+
+    fun isTerminal(): Boolean = terminal
+
+    fun currentGeneration(): Long? = activeGeneration
+}
+
+internal object BleCharacteristicPropertyPolicy {
+    fun supportsResponseWrite(properties: Int): Boolean =
+        properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+
+    fun supportsStatusUpdates(properties: Int): Boolean =
+        properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+
+    fun cccdEnableValue(properties: Int): ByteArray? = when {
+        properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0 ->
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 ->
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        else -> null
+    }
+}
 
 /**
  * Production Android Bluetooth Low Energy repository for the MotoNav ESP32-S3 device.
@@ -74,6 +433,14 @@ class AndroidBleRepository(
     private val bluetoothAdapter: BluetoothAdapter?
         get() = bluetoothManager?.adapter
 
+    private val nextConnectionEpoch = AtomicLong(0L)
+
+    @Volatile
+    private var connectionEpoch = 0L
+
+    @Volatile
+    private var gattOperationQueue: GattOperationQueue? = null
+
     private val _connectionState = MutableStateFlow(ConnectionState.Disconnected)
     override val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -102,16 +469,11 @@ class AndroidBleRepository(
 
     // Transfer synchronization & incoming status notifications
     private var transferJob: Job? = null
-    private data class PendingWrite(
-        val generation: Long,
-        val deferred: CompletableDeferred<Int>
-    )
-
-    private var pendingWriteDeferred: PendingWrite? = null
-    private val writeMutex = Mutex()
     private val incomingStatusFlow = MutableSharedFlow<String>(extraBufferCapacity = 64)
     private val ackSynchronizer = AckSynchronizer(tag = TAG)
     private val routeReadyEventTracker = RouteReadyEventTracker()
+    private val statusNotificationGate = StatusNotificationGate()
+    private val transferTerminalBoundary = TransferTerminalBoundary()
     private val nextTransferGeneration = AtomicLong(0L)
 
     @Volatile
@@ -126,45 +488,9 @@ class AndroidBleRepository(
     // Scanning state & timeout tracking
     private var isScanning = false
     private var scanTimeoutJob: Job? = null
-
-    // BLE Scan Callback
-    private val scanCallback = object : ScanCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            val device = result.device
-            val deviceName = try {
-                device.name
-            } catch (e: SecurityException) {
-                null
-            } ?: result.scanRecord?.deviceName
-
-            Log.d(TAG, "BLE Scan found device: $deviceName (${device.address}), RSSI: ${result.rssi}")
-
-            if (deviceName == BleConstants.TARGET_DEVICE_NAME || device.name == BleConstants.TARGET_DEVICE_NAME) {
-                Log.i(TAG, "Matched target device '${BleConstants.TARGET_DEVICE_NAME}' at ${device.address}")
-                onTargetDeviceDiscovered(device, result.rssi)
-            }
-        }
-
-        override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            for (result in results) {
-                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result)
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            Log.e(TAG, "BLE Scan failed with errorCode: $errorCode")
-            stopScan()
-            val errorText = "BLE scan failed with error code: $errorCode"
-            _connectionState.value = ConnectionState.Error
-            _lastError.value = errorText
-            _diagnostics.value = _diagnostics.value.copy(
-                isScanning = false,
-                disconnectReconnectState = "Scan Failed ($errorCode)",
-                lastError = errorText
-            )
-        }
-    }
+    private val scanAttempts = ScanAttemptCoordinator()
+    private var activeScanGeneration: Long? = null
+    private var activeScanCallback: ScanCallback? = null
 
     // GATT Callback
     private val gattCallback = object : BluetoothGattCallback() {
@@ -185,10 +511,6 @@ class AndroidBleRepository(
                 BluetoothProfile.STATE_CONNECTED -> {
                     Log.i(TAG, "Connected to GATT server on MotoNav-01. Initiating service discovery...")
                     negotiatedAttMtu = null
-                    val mtuRequestStarted = gatt.requestMtu(REQUESTED_ROUTE_ATT_MTU)
-                    if (!mtuRequestStarted) {
-                        Log.w(TAG, "Failed to request ATT MTU $REQUESTED_ROUTE_ATT_MTU")
-                    }
                     _connectionState.value = ConnectionState.Connecting
                     _diagnostics.value = _diagnostics.value.copy(
                         isConnecting = false,
@@ -196,18 +518,7 @@ class AndroidBleRepository(
                         disconnectReconnectState = "Connected to GATT server. Discovering services...",
                         lastError = null
                     )
-
-                    // Request real RSSI from hardware
-                    try {
-                        gatt.readRemoteRssi()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to request initial RSSI", e)
-                    }
-
-                    val discoveryStarted = gatt.discoverServices()
-                    if (!discoveryStarted) {
-                        disconnectAndCleanup("Failed to start GATT service discovery")
-                    }
+                    startGattSetup(gatt)
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -221,6 +532,13 @@ class AndroidBleRepository(
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (!isActiveGatt(gatt)) return
             Log.d(TAG, "onServicesDiscovered status=$status")
+
+            if (!gattOperationQueue?.complete(
+                    kind = GattOperationKind.SERVICE_DISCOVERY,
+                    result = GattOperationResult(status = status),
+                    callbackGattIdentity = gatt
+                ).orFalse()
+            ) return
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 val errMsg = "Service discovery failed with status $status"
@@ -282,6 +600,24 @@ class AndroidBleRepository(
                 return
             }
 
+            val unsupportedCapabilities = mutableListOf<String>()
+            if (!BleCharacteristicPropertyPolicy.supportsResponseWrite(control!!.properties)) {
+                unsupportedCapabilities.add("Control characteristic does not support WRITE")
+            }
+            if (!BleCharacteristicPropertyPolicy.supportsResponseWrite(routeData!!.properties)) {
+                unsupportedCapabilities.add("Route Data characteristic does not support WRITE")
+            }
+            if (!BleCharacteristicPropertyPolicy.supportsStatusUpdates(statusChar!!.properties)) {
+                unsupportedCapabilities.add("Status characteristic supports neither NOTIFY nor INDICATE")
+            }
+            if (unsupportedCapabilities.isNotEmpty()) {
+                val errorMsg = "Unsupported MotoNav characteristic capabilities: ${unsupportedCapabilities.joinToString("; ")}"
+                Log.e(TAG, errorMsg)
+                _diagnostics.value = _diagnostics.value.copy(lastError = errorMsg)
+                disconnectAndCleanup(errorMsg)
+                return
+            }
+
             controlCharacteristic = control
             statusCharacteristic = statusChar
             routeDataCharacteristic = routeData
@@ -298,6 +634,14 @@ class AndroidBleRepository(
         ) {
             if (!isActiveGatt(gatt)) return
             Log.d(TAG, "onDescriptorWrite descriptor=${descriptor.uuid} status=$status")
+            if (!gattOperationQueue?.complete(
+                    kind = GattOperationKind.DESCRIPTOR_WRITE,
+                    targetIdentity = descriptor,
+                    targetUuid = descriptor.uuid,
+                    result = GattOperationResult(status = status),
+                    callbackGattIdentity = gatt
+                ).orFalse()
+            ) return
             if (descriptor.uuid == BleConstants.CCCD_DESCRIPTOR_UUID) {
                 val success = (status == BluetoothGatt.GATT_SUCCESS)
                 if (success) {
@@ -314,14 +658,15 @@ class AndroidBleRepository(
                     disconnectReconnectState = "Notifications active. Reading initial status..."
                 )
 
-                // Read the Status characteristic
-                statusCharacteristic?.let { sc ->
-                    readStatusCharacteristic(gatt, sc)
-                }
-
                 if (_connectionState.value == ConnectionState.Connecting) {
                     _connectionState.value = ConnectionState.Connected
                 }
+
+                // Read the Status characteristic through the same FIFO GATT queue.
+                statusCharacteristic?.let { sc ->
+                    queueStatusRead(gatt, sc, "initial status")
+                }
+                queueRssiRead(gatt)
             }
         }
 
@@ -331,6 +676,15 @@ class AndroidBleRepository(
             Log.i(TAG, "[NOTIFICATION_CALLBACK] Status characteristic notification received (${bytes.size} bytes)")
             Log.i(TAG, "[NOTIFICATION_BYTES] raw hex=[$hexString], utf8='$utf8String'")
             Log.i(TAG, "[NOTIFICATION_PARSED] decoded string='$utf8String'")
+
+            if (!statusNotificationGate.shouldForward(utf8String)) {
+                Log.i(TAG, "[NOTIFICATION_IGNORED] Suppressed post-cancellation transfer status '$utf8String'")
+                return
+            }
+            if (!transferTerminalBoundary.shouldForward(utf8String)) {
+                Log.i(TAG, "[NOTIFICATION_IGNORED] Suppressed post-terminal transfer status '$utf8String'")
+                return
+            }
 
             _diagnostics.value = _diagnostics.value.copy(
                 initialStatusRead = true,
@@ -358,6 +712,14 @@ class AndroidBleRepository(
             status: Int
         ) {
             if (!isActiveGatt(gatt)) return
+            if (!gattOperationQueue?.complete(
+                    kind = GattOperationKind.CHARACTERISTIC_READ,
+                    targetIdentity = characteristic,
+                    targetUuid = characteristic.uuid,
+                    result = GattOperationResult(status = status, value = value),
+                    callbackGattIdentity = gatt
+                ).orFalse()
+            ) return
             if (characteristic.uuid == BleConstants.STATUS_CHAR_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     Log.d(TAG, "onCharacteristicRead Status success")
@@ -387,8 +749,24 @@ class AndroidBleRepository(
                         @Suppress("DEPRECATION")
                         val bytes = characteristic.value ?: ByteArray(0)
                         Log.d(TAG, "onCharacteristicRead (legacy) Status success")
-                        handleIncomingStatusNotification(bytes)
+                        if (gattOperationQueue?.complete(
+                                kind = GattOperationKind.CHARACTERISTIC_READ,
+                                targetIdentity = characteristic,
+                                targetUuid = characteristic.uuid,
+                                result = GattOperationResult(status = status, value = bytes),
+                                callbackGattIdentity = gatt
+                            ) == true
+                        ) {
+                            handleIncomingStatusNotification(bytes)
+                        }
                     } else {
+                        gattOperationQueue?.complete(
+                            kind = GattOperationKind.CHARACTERISTIC_READ,
+                            targetIdentity = characteristic,
+                            targetUuid = characteristic.uuid,
+                            result = GattOperationResult(status = status),
+                            callbackGattIdentity = gatt
+                        )
                         val errMsg = "Read Status characteristic failed with status $status"
                         Log.e(TAG, errMsg)
                         _diagnostics.value = _diagnostics.value.copy(
@@ -433,20 +811,35 @@ class AndroidBleRepository(
         ) {
             if (!isActiveGatt(gatt)) return
             Log.d(TAG, "onCharacteristicWrite char=${characteristic.uuid} status=$status")
-            val pendingWrite = pendingWriteDeferred
-            if (pendingWrite != null && pendingWrite.generation == activeTransferGeneration) {
-                pendingWrite.deferred.complete(status)
-            }
+            gattOperationQueue?.complete(
+                kind = GattOperationKind.CHARACTERISTIC_WRITE,
+                targetIdentity = characteristic,
+                targetUuid = characteristic.uuid,
+                result = GattOperationResult(status = status),
+                callbackGattIdentity = gatt
+            )
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (!isActiveGatt(gatt)) return
+            if (!gattOperationQueue?.complete(
+                    kind = GattOperationKind.MTU,
+                    result = GattOperationResult(status = status, mtu = mtu),
+                    callbackGattIdentity = gatt
+                ).orFalse()
+            ) return
             negotiatedAttMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else null
             Log.i(TAG, "onMtuChanged: mtu=$mtu, status=$status")
         }
 
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
             if (!isActiveGatt(gatt)) return
+            if (!gattOperationQueue?.complete(
+                    kind = GattOperationKind.RSSI,
+                    result = GattOperationResult(status = status, rssi = rssi),
+                    callbackGattIdentity = gatt
+                ).orFalse()
+            ) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "onReadRemoteRssi: $rssi dBm")
                 _connectedDevice.value = _connectedDevice.value?.copy(rssiDbm = rssi)
@@ -519,6 +912,13 @@ class AndroidBleRepository(
             return
         }
 
+        if (isScanning || activeScanCallback != null) {
+            invalidateScan()
+        }
+        val generation = scanAttempts.begin()
+        activeScanGeneration = generation
+        val callback = createScanCallback(generation)
+        activeScanCallback = callback
         isScanning = true
         Log.i(TAG, "Starting BLE scan for '${BleConstants.TARGET_DEVICE_NAME}'...")
 
@@ -531,8 +931,9 @@ class AndroidBleRepository(
             .build()
 
         try {
-            scanner.startScan(listOf(scanFilter), scanSettings, scanCallback)
+            scanner.startScan(listOf(scanFilter), scanSettings, callback)
         } catch (e: Exception) {
+            invalidateScan(generation)
             val err = "Failed to start BLE scan: ${e.message}"
             Log.e(TAG, err, e)
             _lastError.value = err
@@ -549,10 +950,14 @@ class AndroidBleRepository(
         scanTimeoutJob?.cancel()
         scanTimeoutJob = scope.launch {
             delay(SCAN_TIMEOUT_MS)
-            if (isScanning && _connectionState.value == ConnectionState.Connecting) {
+            if (scanAttempts.isCurrent(generation) &&
+                activeScanGeneration == generation &&
+                isScanning &&
+                _connectionState.value == ConnectionState.Connecting
+            ) {
                 val timeoutErr = "MotoNav-01 not found within 15s. Ensure the ESP32 is powered on and advertising."
                 Log.w(TAG, timeoutErr)
-                stopScan()
+                stopScan(generation)
                 _connectionState.value = ConnectionState.Disconnected
                 _lastError.value = timeoutErr
                 _diagnostics.value = _diagnostics.value.copy(
@@ -564,23 +969,102 @@ class AndroidBleRepository(
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun stopScan() {
-        if (!isScanning) return
-        isScanning = false
-        scanTimeoutJob?.cancel()
-        scanTimeoutJob = null
-        try {
-            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-            Log.d(TAG, "BLE scan stopped")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error stopping BLE scan", e)
+    private fun createScanCallback(generation: Long): ScanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!scanAttempts.isCurrent(generation) ||
+                activeScanGeneration != generation ||
+                !isScanning ||
+                _connectionState.value != ConnectionState.Connecting ||
+                bluetoothGatt != null ||
+                gattOperationQueue != null
+            ) return
+
+            val device = result.device
+            val deviceName = try {
+                device.name
+            } catch (e: SecurityException) {
+                null
+            } ?: result.scanRecord?.deviceName
+
+            Log.d(TAG, "BLE Scan found device: $deviceName (${device.address}), RSSI: ${result.rssi}")
+
+            if (deviceName == BleConstants.TARGET_DEVICE_NAME || device.name == BleConstants.TARGET_DEVICE_NAME) {
+                Log.i(TAG, "Matched target device '${BleConstants.TARGET_DEVICE_NAME}' at ${device.address}")
+                onTargetDeviceDiscovered(generation, device, result.rssi)
+            }
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>) {
+            for (result in results) {
+                onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, result)
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            if (!scanAttempts.isCurrent(generation) ||
+                activeScanGeneration != generation ||
+                !isScanning ||
+                _connectionState.value != ConnectionState.Connecting
+            ) return
+
+            Log.e(TAG, "BLE Scan failed with errorCode: $errorCode")
+            stopScan(generation)
+            val errorText = "BLE scan failed with error code: $errorCode"
+            _connectionState.value = ConnectionState.Error
+            _lastError.value = errorText
+            _diagnostics.value = _diagnostics.value.copy(
+                isScanning = false,
+                disconnectReconnectState = "Scan Failed ($errorCode)",
+                lastError = errorText
+            )
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun onTargetDeviceDiscovered(device: BluetoothDevice, rssi: Int) {
-        stopScan()
+    private fun invalidateScan(generation: Long? = activeScanGeneration) {
+        val callback = activeScanCallback
+        val scanner = bluetoothAdapter?.bluetoothLeScanner
+        scanAttempts.invalidate(generation)
+        activeScanGeneration = null
+        isScanning = false
+        scanTimeoutJob?.cancel()
+        scanTimeoutJob = null
+        try {
+            if (callback != null) scanner?.stopScan(callback)
+            Log.d(TAG, "BLE scan stopped")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping BLE scan", e)
+        }
+        activeScanCallback = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScan(expectedGeneration: Long? = activeScanGeneration) {
+        if (expectedGeneration != null && activeScanGeneration != expectedGeneration) return
+        if (!isScanning && activeScanCallback == null) {
+            scanAttempts.invalidate(expectedGeneration)
+            return
+        }
+        invalidateScan(expectedGeneration)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun onTargetDeviceDiscovered(
+        generation: Long,
+        device: BluetoothDevice,
+        rssi: Int
+    ) {
+        if (!scanAttempts.isCurrent(generation) ||
+            activeScanGeneration != generation ||
+            !isScanning ||
+            _connectionState.value != ConnectionState.Connecting ||
+            bluetoothGatt != null ||
+            gattOperationQueue != null ||
+            !scanAttempts.claim(generation)
+        ) return
+
+        stopScan(generation)
 
         // Create device representation without fake metrics
         _connectedDevice.value = MotoNavDevice(
@@ -605,10 +1089,97 @@ class AndroidBleRepository(
         )
 
         Log.i(TAG, "Connecting GATT to MotoNav-01 at ${device.address}...")
-        bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        val epoch = nextConnectionEpoch.incrementAndGet()
+        connectionEpoch = epoch
+        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
             device.connectGatt(context, false, gattCallback)
+        }
+        bluetoothGatt = gatt
+        gattOperationQueue = gatt?.let {
+            GattOperationQueue(
+                gattIdentity = it,
+                epoch = epoch,
+                scope = scope,
+                onTimeout = { token ->
+                    if (isCurrentGattToken(token)) {
+                        disconnectAndCleanup("Timed out waiting for ${token.kind} GATT callback")
+                    }
+                },
+                onCancellation = { token ->
+                    if (isCurrentGattToken(token)) {
+                        disconnectAndCleanup("GATT operation canceled")
+                    }
+                }
+            )
+        }
+    }
+
+    private fun isCurrentGattToken(token: GattOperationToken): Boolean =
+        token.epoch == connectionEpoch &&
+            bluetoothGatt === token.gattIdentity
+
+    @SuppressLint("MissingPermission")
+    private fun startGattSetup(gatt: BluetoothGatt) {
+        val queue = gattOperationQueue
+        if (queue == null || !isActiveGatt(gatt)) {
+            disconnectAndCleanup("GATT operation queue unavailable")
+            return
+        }
+
+        scope.launch {
+            try {
+                val mtuResult = queue.execute(
+                    kind = GattOperationKind.MTU,
+                    timeoutMs = 5_000L
+                ) { token ->
+                    val started = gatt.requestMtu(REQUESTED_ROUTE_ATT_MTU)
+                    if (!started) {
+                        Log.w(TAG, "Failed to request ATT MTU $REQUESTED_ROUTE_ATT_MTU")
+                        queue.complete(
+                            kind = GattOperationKind.MTU,
+                            result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                        )
+                    }
+                    // A false return preserves the existing behavior: continue setup,
+                    // leave negotiatedAttMtu unavailable, and block transfer later.
+                    true
+                }
+                if (mtuResult.status != BluetoothGatt.GATT_SUCCESS) negotiatedAttMtu = null
+            } catch (e: GattOperationStartException) {
+                Log.w(TAG, "MTU request could not be started", e)
+            } catch (e: GattOperationTimeoutException) {
+                return@launch
+            } catch (e: GattOperationInvalidatedException) {
+                return@launch
+            }
+
+            if (!isActiveGatt(gatt)) return@launch
+            try {
+                val discoveryResult = queue.execute(
+                    kind = GattOperationKind.SERVICE_DISCOVERY,
+                    timeoutMs = 10_000L
+                ) {
+                    val started = gatt.discoverServices()
+                    if (!started) {
+                        queue.complete(
+                            kind = GattOperationKind.SERVICE_DISCOVERY,
+                            result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                        )
+                    }
+                    true
+                }
+                if (discoveryResult.status != BluetoothGatt.GATT_SUCCESS) {
+                    disconnectAndCleanup("Failed to start GATT service discovery")
+                }
+            } catch (_: GattOperationTimeoutException) {
+                return@launch
+            } catch (_: GattOperationInvalidatedException) {
+                return@launch
+            } catch (e: GattOperationStartException) {
+                disconnectAndCleanup("Failed to start GATT service discovery")
+            }
         }
     }
 
@@ -633,22 +1204,66 @@ class AndroidBleRepository(
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val res = gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            if (res != BluetoothStatusCodes.SUCCESS) {
-                val errorMessage = "CCCD descriptor write returned status $res"
-                Log.e(TAG, errorMessage)
-                disconnectAndCleanup(errorMessage)
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            @Suppress("DEPRECATION")
-            val writeSuccess = gatt.writeDescriptor(descriptor)
-            if (!writeSuccess) {
-                val errorMessage = "CCCD descriptor write could not be started"
-                Log.e(TAG, errorMessage)
-                disconnectAndCleanup(errorMessage)
+        val cccdEnableValue = BleCharacteristicPropertyPolicy.cccdEnableValue(statusChar.properties)
+        if (cccdEnableValue == null) {
+            val errorMessage = "Status characteristic supports neither NOTIFY nor INDICATE"
+            Log.e(TAG, errorMessage)
+            disconnectAndCleanup(errorMessage)
+            return
+        }
+
+        val queue = gattOperationQueue
+        if (queue == null) {
+            disconnectAndCleanup("GATT operation queue unavailable for CCCD write")
+            return
+        }
+
+        scope.launch {
+            try {
+                val result = queue.execute(
+                    kind = GattOperationKind.DESCRIPTOR_WRITE,
+                    targetIdentity = descriptor,
+                    targetUuid = descriptor.uuid,
+                    timeoutMs = 5_000L
+                ) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        val code = gatt.writeDescriptor(descriptor, cccdEnableValue)
+                        if (code != BluetoothStatusCodes.SUCCESS) {
+                            queue.complete(
+                                kind = GattOperationKind.DESCRIPTOR_WRITE,
+                                targetIdentity = descriptor,
+                                targetUuid = descriptor.uuid,
+                                result = GattOperationResult(status = code)
+                            )
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        descriptor.value = cccdEnableValue
+                        @Suppress("DEPRECATION")
+                        val started = gatt.writeDescriptor(descriptor)
+                        if (!started) {
+                            queue.complete(
+                                kind = GattOperationKind.DESCRIPTOR_WRITE,
+                                targetIdentity = descriptor,
+                                targetUuid = descriptor.uuid,
+                                result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                            )
+                        }
+                    }
+                    true
+                }
+                if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                    disconnectAndCleanup("CCCD descriptor write failed with status ${result.status}")
+                }
+            } catch (_: GattOperationTimeoutException) {
+                // Queue timeout invalidates and closes the GATT.
+            } catch (_: GattOperationInvalidatedException) {
+                // Disconnect/cleanup owns the resulting state.
+            } catch (e: GattOperationStartException) {
+                val err = "Error starting CCCD descriptor write: ${e.message}"
+                Log.e(TAG, err)
+                _lastError.value = err
+                _diagnostics.value = _diagnostics.value.copy(lastError = err)
             }
         }
     }
@@ -656,19 +1271,54 @@ class AndroidBleRepository(
     @SuppressLint("MissingPermission")
     private fun readStatusCharacteristic(
         gatt: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic
+        characteristic: BluetoothGattCharacteristic,
+        description: String = "status"
     ) {
-        try {
-            @Suppress("DEPRECATION")
-            val success = gatt.readCharacteristic(characteristic)
-            if (!success) {
-                Log.w(TAG, "readCharacteristic returned false")
-            }
-        } catch (e: Exception) {
-            val err = "Error executing readCharacteristic: ${e.message}"
-            Log.e(TAG, err, e)
+        val queue = gattOperationQueue
+        if (queue == null) {
+            val err = "Cannot read $description: GATT operation queue unavailable"
+            Log.e(TAG, err)
             _lastError.value = err
             _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            return
+        }
+
+        scope.launch {
+            try {
+                val result = queue.execute(
+                    kind = GattOperationKind.CHARACTERISTIC_READ,
+                    targetIdentity = characteristic,
+                    targetUuid = characteristic.uuid,
+                    timeoutMs = 5_000L
+                ) {
+                    @Suppress("DEPRECATION")
+                    val started = gatt.readCharacteristic(characteristic)
+                    if (!started) {
+                        queue.complete(
+                            kind = GattOperationKind.CHARACTERISTIC_READ,
+                            targetIdentity = characteristic,
+                            targetUuid = characteristic.uuid,
+                            result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                        )
+                    }
+                    true
+                }
+                if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                    val err = "Read $description failed with status ${result.status}"
+                    Log.w(TAG, err)
+                    _lastError.value = err
+                    _diagnostics.value = _diagnostics.value.copy(lastError = err)
+                }
+            } catch (_: GattOperationTimeoutException) {
+                // Queue timeout invalidates and closes the GATT.
+            } catch (_: GattOperationInvalidatedException) {
+                // Disconnect/cleanup owns the resulting state.
+            } catch (e: GattOperationStartException) {
+                val err = "Error starting $description read: ${e.message}"
+                Log.e(TAG, err)
+                _lastError.value = err
+                _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            }
         }
     }
 
@@ -688,7 +1338,46 @@ class AndroidBleRepository(
         _diagnostics.value = _diagnostics.value.copy(
             disconnectReconnectState = "Reading Status characteristic..."
         )
-        readStatusCharacteristic(gatt, statusChar)
+        readStatusCharacteristic(gatt, statusChar, "status")
+    }
+
+    private fun queueStatusRead(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        description: String
+    ) {
+        readStatusCharacteristic(gatt, characteristic, description)
+    }
+
+    private fun queueRssiRead(gatt: BluetoothGatt) {
+        val queue = gattOperationQueue ?: return
+        if (!isActiveGatt(gatt)) return
+        scope.launch {
+            try {
+                val result = queue.execute(
+                    kind = GattOperationKind.RSSI,
+                    timeoutMs = 5_000L
+                ) {
+                    val started = gatt.readRemoteRssi()
+                    if (!started) {
+                        queue.complete(
+                            kind = GattOperationKind.RSSI,
+                            result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                        )
+                    }
+                    true
+                }
+                if (result.status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.w(TAG, "Initial RSSI read failed with status ${result.status}")
+                }
+            } catch (_: GattOperationTimeoutException) {
+                // Queue timeout invalidates and closes the GATT.
+            } catch (_: GattOperationInvalidatedException) {
+                // Disconnect/cleanup owns the resulting state.
+            } catch (e: GattOperationStartException) {
+                Log.e(TAG, "Error starting initial RSSI read: ${e.message}")
+            }
+        }
     }
 
     private fun handleStatusString(raw: String) {
@@ -731,22 +1420,29 @@ class AndroidBleRepository(
 
     @SuppressLint("MissingPermission")
     override fun disconnect() {
-        stopScan()
+        invalidateScan()
+        statusNotificationGate.resetConnection()
+        transferTerminalBoundary.reset()
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
         cancellingTransferGeneration = null
         transferJob?.cancel()
         ackSynchronizer.deactivate(generation.takeIf { it != 0L })
-        bluetoothGatt?.let { gatt ->
+        connectionEpoch = nextConnectionEpoch.incrementAndGet()
+        val gatt = bluetoothGatt
+        val queue = gattOperationQueue
+        gattOperationQueue = null
+        bluetoothGatt = null
+        queue?.invalidate(CancellationException("GATT disconnected"))
+        gatt?.let { activeGatt ->
             try {
-                gatt.disconnect()
-                gatt.close()
+                activeGatt.disconnect()
+                activeGatt.close()
                 Log.d(TAG, "GATT disconnected and closed")
             } catch (e: Exception) {
                 Log.e(TAG, "Error disconnecting GATT", e)
             }
         }
-        bluetoothGatt = null
         negotiatedAttMtu = null
         controlCharacteristic = null
         statusCharacteristic = null
@@ -770,20 +1466,27 @@ class AndroidBleRepository(
     }
 
     private fun disconnectAndCleanup(errorMessage: String?) {
+        invalidateScan()
+        statusNotificationGate.resetConnection()
+        transferTerminalBoundary.reset()
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
         cancellingTransferGeneration = null
         transferJob?.cancel()
         ackSynchronizer.deactivate(generation.takeIf { it != 0L })
-        pendingWriteDeferred?.deferred?.completeExceptionally(CancellationException("GATT disconnected"))
-        pendingWriteDeferred = null
+        connectionEpoch = nextConnectionEpoch.incrementAndGet()
+        val queue = gattOperationQueue
+        gattOperationQueue = null
+        val gatt = bluetoothGatt
+        bluetoothGatt = null
+        queue?.invalidate(CancellationException("GATT disconnected"))
 
         try {
-            bluetoothGatt?.close()
+            gatt?.disconnect()
+            gatt?.close()
         } catch (e: Exception) {
             Log.e(TAG, "Error closing GATT in cleanup", e)
         }
-        bluetoothGatt = null
         negotiatedAttMtu = null
         controlCharacteristic = null
         statusCharacteristic = null
@@ -820,56 +1523,68 @@ class AndroidBleRepository(
         data: ByteArray,
         charDescription: String = characteristic.uuid.toString(),
         allowDuringCancellation: Boolean = false
-    ): Boolean = writeMutex.withLock {
+    ): Boolean {
         if (activeTransferGeneration != generation ||
             (!allowDuringCancellation && isTransferCancelling(generation))
-        ) return@withLock false
+        ) return false
 
-        val deferred = CompletableDeferred<Int>()
-        pendingWriteDeferred = PendingWrite(generation, deferred)
+        val queue = gattOperationQueue ?: return false
 
-        val hasWriteResponse = (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
-        val writeType = if (hasWriteResponse) {
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        } else {
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        if (!BleCharacteristicPropertyPolicy.supportsResponseWrite(characteristic.properties)) {
+            Log.e(TAG, "[GATT_WRITE_FAIL] $charDescription does not support WRITE")
+            return false
         }
+        val writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
         try {
-            Log.d(TAG, "[GATT_WRITE_START] Writing ${data.size} bytes to $charDescription (writeType: $writeType)")
-            val initiated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val code = gatt.writeCharacteristic(characteristic, data, writeType)
-                code == BluetoothStatusCodes.SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                characteristic.value = data
-                @Suppress("DEPRECATION")
-                characteristic.writeType = writeType
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(characteristic)
-            }
-
-            if (!initiated) {
-                Log.e(TAG, "[GATT_WRITE_FAIL] writeCharacteristic returned false for $charDescription")
-                if (pendingWriteDeferred?.generation == generation) {
-                    pendingWriteDeferred = null
+            val result = queue.execute(
+                kind = GattOperationKind.CHARACTERISTIC_WRITE,
+                targetIdentity = characteristic,
+                targetUuid = characteristic.uuid,
+                transferGeneration = generation,
+                timeoutMs = 5_000L
+            ) {
+                Log.d(TAG, "[GATT_WRITE_START] Writing ${data.size} bytes to $charDescription (writeType: $writeType)")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val code = gatt.writeCharacteristic(characteristic, data, writeType)
+                    if (code != BluetoothStatusCodes.SUCCESS) {
+                        queue.complete(
+                            kind = GattOperationKind.CHARACTERISTIC_WRITE,
+                            targetIdentity = characteristic,
+                            targetUuid = characteristic.uuid,
+                            result = GattOperationResult(status = code)
+                        )
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = data
+                    @Suppress("DEPRECATION")
+                    characteristic.writeType = writeType
+                    @Suppress("DEPRECATION")
+                    val started = gatt.writeCharacteristic(characteristic)
+                    if (!started) {
+                        queue.complete(
+                            kind = GattOperationKind.CHARACTERISTIC_WRITE,
+                            targetIdentity = characteristic,
+                            targetUuid = characteristic.uuid,
+                            result = GattOperationResult(status = BluetoothGatt.GATT_FAILURE)
+                        )
+                    }
                 }
-                return@withLock false
+                true
             }
-
-            val status = withTimeout(5000L) {
-                deferred.await()
-            }
+            val status = result.status
             val success = (status == BluetoothGatt.GATT_SUCCESS)
             Log.d(TAG, "[GATT_WRITE_END] Write to $charDescription finished with status=$status (success=$success)")
-            return@withLock success
+            return success
+        } catch (_: GattOperationTimeoutException) {
+            Log.e(TAG, "[GATT_WRITE_TIMEOUT] Timed out writing to $charDescription")
+            return false
+        } catch (_: GattOperationInvalidatedException) {
+            return false
         } catch (e: Exception) {
             Log.e(TAG, "[GATT_WRITE_ERROR] Exception during write to $charDescription: ${e.message}")
-            return@withLock false
-        } finally {
-            if (pendingWriteDeferred?.generation == generation) {
-                pendingWriteDeferred = null
-            }
+            return false
         }
     }
 
@@ -974,6 +1689,8 @@ class AndroidBleRepository(
 
         val hexCrc = "0x${crc32.toString(16).uppercase()}"
         val transferGeneration = nextTransferGeneration.incrementAndGet()
+        statusNotificationGate.markTransferStarted()
+        transferTerminalBoundary.begin(transferGeneration)
         activeTransferGeneration = transferGeneration
         cancellingTransferGeneration = null
         val previousTransferJob = transferJob
@@ -1107,7 +1824,7 @@ class AndroidBleRepository(
                     stepDescription = "Verifying route CRC on MotoNav-01..."
                 )
 
-                readStatusCharacteristic(gatt, statusChar)
+                readStatusCharacteristic(gatt, statusChar, "route verification")
                 val verificationEvent = routeReadyEventTracker.awaitVerificationEvent(
                     generation = routeReadyGeneration,
                     timeoutMs = 6000L
@@ -1125,6 +1842,7 @@ class AndroidBleRepository(
 
                 // 8. Display transfer progress and final result
                 if (activeTransferGeneration != transferGeneration || isTransferCancelling(transferGeneration)) return@launch
+                terminateTransferGeneration(transferGeneration)
                 val readyStatus = _diagnostics.value.lastStatusMessage ?: "ROUTE_READY,${binary.size}/${binary.size}"
                 Log.i(TAG, "Route transfer PASSED! Status: $readyStatus")
                 _connectionState.value = ConnectionState.RouteReady
@@ -1155,6 +1873,7 @@ class AndroidBleRepository(
 
     private fun handleTransferError(generation: Long, errorMessage: String) {
         if (activeTransferGeneration != generation) return
+        terminateTransferGeneration(generation)
         Log.e(TAG, "Route transfer error: $errorMessage")
         _lastError.value = errorMessage
         _connectionState.value = ConnectionState.Error
@@ -1168,6 +1887,14 @@ class AndroidBleRepository(
             lastError = errorMessage,
             disconnectReconnectState = "Transfer Error: $errorMessage"
         )
+    }
+
+    private fun terminateTransferGeneration(generation: Long): Boolean {
+        val terminated = transferTerminalBoundary.terminate(generation)
+        if (terminated && activeTransferGeneration == generation) {
+            activeTransferGeneration = 0L
+        }
+        return terminated
     }
 
     override fun cancelTransfer() {
@@ -1204,6 +1931,7 @@ class AndroidBleRepository(
             ackSynchronizer.deactivate(generation)
 
             if (cancelSucceeded) {
+                statusNotificationGate.markTransferCancelled()
                 _connectionState.value = ConnectionState.Connected
                 _transferProgress.value = RouteTransferProgress(0, 0, 0, "Transfer cancelled")
             } else {

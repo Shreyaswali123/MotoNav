@@ -133,7 +133,7 @@ class SampleRouteRepository : RouteRepository {
         val cleanQuery = query.trim().lowercase()
         return sampleRoutesList.filter {
             it.title.lowercase().contains(cleanQuery) ||
-            it.destination.name?.lowercase()?.contains(cleanQuery) == true ||
+            it.destination?.name?.lowercase()?.contains(cleanQuery) == true ||
             it.summary.lowercase().contains(cleanQuery)
         }
     }

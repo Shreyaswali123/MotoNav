@@ -280,6 +280,7 @@ class RouteViewModel(
         _locationValidationError.value = null
         invalidateGeneratedRoute()
         _selectedRoute.value = _selectedRoute.value.copy(
+            startLocation = null,
             waypoints = emptyList(),
             maneuvers = emptyList(),
             totalDistanceMeters = 0,
@@ -292,6 +293,7 @@ class RouteViewModel(
         _locationValidationError.value = null
         invalidateGeneratedRoute()
         _selectedRoute.value = _selectedRoute.value.copy(
+            destination = null,
             waypoints = emptyList(),
             maneuvers = emptyList(),
             totalDistanceMeters = 0,

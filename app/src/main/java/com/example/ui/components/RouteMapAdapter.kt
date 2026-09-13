@@ -153,6 +153,11 @@ object RouteMapAdapter {
             append(firstWp?.latitude ?: 0.0).append(',').append(firstWp?.longitude ?: 0.0)
             append('|')
             append(lastWp?.latitude ?: 0.0).append(',').append(lastWp?.longitude ?: 0.0)
+            append('|')
+            append("geometry:")
+            waypoints?.forEach { waypoint ->
+                append(waypoint.latitude).append(',').append(waypoint.longitude).append(';')
+            }
         }
     }
 
@@ -170,7 +175,7 @@ object RouteMapAdapter {
             id = "origin_marker",
             type = MapMarkerType.ORIGIN,
             position = Position(longitude = startLocation!!.longitude, latitude = startLocation.latitude),
-            label = startLocation.name ?: "Origin"
+            label = startLocation?.name ?: "Origin"
         )
     }
 
@@ -183,7 +188,7 @@ object RouteMapAdapter {
             id = "destination_marker",
             type = MapMarkerType.DESTINATION,
             position = Position(longitude = destination!!.longitude, latitude = destination.latitude),
-            label = destination.name ?: "Destination"
+            label = destination?.name ?: "Destination"
         )
     }
 
