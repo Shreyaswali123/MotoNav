@@ -14,9 +14,13 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.model.BleDiagnostics
 import com.example.model.ConnectionState
 import com.example.model.MotoNavDevice
@@ -33,6 +37,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.ArrayDeque
 import java.util.UUID
@@ -399,6 +404,104 @@ internal object BleCharacteristicPropertyPolicy {
     }
 }
 
+internal sealed interface BondAction {
+    object StartGattSetup : BondAction
+    object InitiateCreateBond : BondAction
+    object WaitForBonding : BondAction
+    data class PairingFailed(val message: String) : BondAction
+    object None : BondAction
+}
+
+/** Coordinates LE Security and bonding state transitions across connection epochs. */
+internal class BleBondCoordinator {
+    private val lock = Any()
+    private var activeEpoch: Long? = null
+    private var activeDeviceAddress: String? = null
+    private var pairingInProgress: Boolean = false
+    private var gattSetupStarted: Boolean = false
+
+    fun begin(epoch: Long, deviceAddress: String?) = synchronized(lock) {
+        activeEpoch = epoch
+        activeDeviceAddress = deviceAddress
+        pairingInProgress = false
+        gattSetupStarted = false
+    }
+
+    fun onConnected(epoch: Long, deviceAddress: String?, bondState: Int): BondAction = synchronized(lock) {
+        if (activeEpoch != epoch || activeDeviceAddress != deviceAddress) return@synchronized BondAction.None
+        when (bondState) {
+            BluetoothDevice.BOND_BONDED -> {
+                if (!gattSetupStarted) {
+                    gattSetupStarted = true
+                    BondAction.StartGattSetup
+                } else {
+                    BondAction.None
+                }
+            }
+            BluetoothDevice.BOND_BONDING -> {
+                pairingInProgress = true
+                BondAction.WaitForBonding
+            }
+            BluetoothDevice.BOND_NONE -> {
+                pairingInProgress = true
+                BondAction.InitiateCreateBond
+            }
+            else -> BondAction.None
+        }
+    }
+
+    fun onBondStateChanged(
+        epoch: Long,
+        deviceAddress: String?,
+        bondState: Int,
+        prevBondState: Int
+    ): BondAction = synchronized(lock) {
+        if (activeEpoch != epoch || activeDeviceAddress != deviceAddress) return@synchronized BondAction.None
+
+        when (bondState) {
+            BluetoothDevice.BOND_BONDING -> {
+                pairingInProgress = true
+                BondAction.WaitForBonding
+            }
+            BluetoothDevice.BOND_BONDED -> {
+                pairingInProgress = false
+                if (!gattSetupStarted) {
+                    gattSetupStarted = true
+                    BondAction.StartGattSetup
+                } else {
+                    BondAction.None
+                }
+            }
+            BluetoothDevice.BOND_NONE -> {
+                if (pairingInProgress || prevBondState == BluetoothDevice.BOND_BONDING) {
+                    pairingInProgress = false
+                    BondAction.PairingFailed("Pairing with MotoNav-01 was cancelled or failed")
+                } else {
+                    BondAction.None
+                }
+            }
+            else -> BondAction.None
+        }
+    }
+
+    fun isBonded(bondState: Int?): Boolean = bondState == BluetoothDevice.BOND_BONDED
+
+    fun isPairingInProgress(): Boolean = synchronized(lock) { pairingInProgress }
+
+    fun isGattSetupStarted(): Boolean = synchronized(lock) { gattSetupStarted }
+
+    fun activeEpoch(): Long? = synchronized(lock) { activeEpoch }
+
+    fun activeDeviceAddress(): String? = synchronized(lock) { activeDeviceAddress }
+
+    fun reset() = synchronized(lock) {
+        activeEpoch = null
+        activeDeviceAddress = null
+        pairingInProgress = false
+        gattSetupStarted = false
+    }
+}
+
 /**
  * Production Android Bluetooth Low Energy repository for the MotoNav ESP32-S3 device.
  *
@@ -492,6 +595,11 @@ class AndroidBleRepository(
     private var activeScanGeneration: Long? = null
     private var activeScanCallback: ScanCallback? = null
 
+    // BLE Security & Bonding
+    private val bondCoordinator = BleBondCoordinator()
+    private var bondStateReceiver: BroadcastReceiver? = null
+    private var isBondReceiverRegistered = false
+
     // GATT Callback
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
@@ -509,16 +617,15 @@ class AndroidBleRepository(
 
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "Connected to GATT server on MotoNav-01. Initiating service discovery...")
+                    Log.i(TAG, "Connected to GATT server on MotoNav-01. Checking bond state...")
                     negotiatedAttMtu = null
                     _connectionState.value = ConnectionState.Connecting
                     _diagnostics.value = _diagnostics.value.copy(
                         isConnecting = false,
                         isConnected = true,
-                        disconnectReconnectState = "Connected to GATT server. Discovering services...",
                         lastError = null
                     )
-                    startGattSetup(gatt)
+                    handleConnectedBondState(gatt, connectionEpoch)
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -1091,6 +1198,8 @@ class AndroidBleRepository(
         Log.i(TAG, "Connecting GATT to MotoNav-01 at ${device.address}...")
         val epoch = nextConnectionEpoch.incrementAndGet()
         connectionEpoch = epoch
+        bondCoordinator.begin(epoch, device.address)
+        registerBondStateReceiver(epoch)
         val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         } else {
@@ -1119,6 +1228,147 @@ class AndroidBleRepository(
     private fun isCurrentGattToken(token: GattOperationToken): Boolean =
         token.epoch == connectionEpoch &&
             bluetoothGatt === token.gattIdentity
+
+    private fun registerBondStateReceiver(epoch: Long) {
+        unregisterBondStateReceiver()
+        val receiver = object : BroadcastReceiver() {
+            @SuppressLint("MissingPermission")
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                }
+                val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+                val prevBondState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
+                handleBondStateChanged(epoch, device, bondState, prevBondState)
+            }
+        }
+        bondStateReceiver = receiver
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        try {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                ContextCompat.RECEIVER_EXPORTED
+            )
+            isBondReceiverRegistered = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register bondStateReceiver", e)
+        }
+    }
+
+    private fun unregisterBondStateReceiver() {
+        val receiver = bondStateReceiver
+        bondStateReceiver = null
+        if (isBondReceiverRegistered && receiver != null) {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error unregistering bondStateReceiver", e)
+            } finally {
+                isBondReceiverRegistered = false
+            }
+        } else {
+            isBondReceiverRegistered = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleConnectedBondState(gatt: BluetoothGatt, epoch: Long) {
+        if (!isActiveGatt(gatt) || connectionEpoch != epoch) return
+        val device = gatt.device ?: run {
+            disconnectAndCleanup("GATT device is unavailable")
+            return
+        }
+        val bondState = try {
+            device.bondState
+        } catch (e: SecurityException) {
+            disconnectAndCleanup("Bluetooth connect permission missing for bond check")
+            return
+        }
+
+        when (val action = bondCoordinator.onConnected(epoch, device.address, bondState)) {
+            is BondAction.StartGattSetup -> {
+                Log.i(TAG, "Device is already BOND_BONDED. Starting GATT setup...")
+                _diagnostics.value = _diagnostics.value.copy(
+                    isBonded = true,
+                    isBonding = false,
+                    disconnectReconnectState = "Connected and bonded. Discovering services..."
+                )
+                startGattSetup(gatt)
+            }
+            is BondAction.InitiateCreateBond -> {
+                Log.i(TAG, "Device is BOND_NONE. Initiating createBond()...")
+                _diagnostics.value = _diagnostics.value.copy(
+                    isBonded = false,
+                    isBonding = true,
+                    disconnectReconnectState = "Pairing with MotoNav-01... Enter passkey on phone"
+                )
+                val initiated = try {
+                    device.createBond()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Exception calling createBond()", e)
+                    false
+                }
+                if (!initiated) {
+                    disconnectAndCleanup("Failed to initiate BLE bonding with MotoNav-01")
+                }
+            }
+            is BondAction.WaitForBonding -> {
+                Log.i(TAG, "Device is BOND_BONDING. Waiting for bond completion...")
+                _diagnostics.value = _diagnostics.value.copy(
+                    isBonded = false,
+                    isBonding = true,
+                    disconnectReconnectState = "Pairing with MotoNav-01 in progress..."
+                )
+            }
+            is BondAction.PairingFailed -> {
+                disconnectAndCleanup(action.message)
+            }
+            is BondAction.None -> Unit
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleBondStateChanged(
+        epoch: Long,
+        device: BluetoothDevice?,
+        bondState: Int,
+        prevBondState: Int
+    ) {
+        val gatt = bluetoothGatt ?: return
+        if (!isActiveGatt(gatt)) return
+
+        when (val action = bondCoordinator.onBondStateChanged(epoch, device?.address, bondState, prevBondState)) {
+            is BondAction.StartGattSetup -> {
+                Log.i(TAG, "Bonding complete (BOND_BONDED). Resuming GATT setup...")
+                _diagnostics.value = _diagnostics.value.copy(
+                    isBonded = true,
+                    isBonding = false,
+                    disconnectReconnectState = "Bonded with MotoNav-01. Discovering services..."
+                )
+                startGattSetup(gatt)
+            }
+            is BondAction.WaitForBonding -> {
+                Log.i(TAG, "Bonding in progress (BOND_BONDING)...")
+                _diagnostics.value = _diagnostics.value.copy(
+                    isBonded = false,
+                    isBonding = true,
+                    disconnectReconnectState = "Pairing with MotoNav-01... Enter passkey on phone"
+                )
+            }
+            is BondAction.PairingFailed -> {
+                Log.w(TAG, "Bonding failed: ${action.message}")
+                disconnectAndCleanup(action.message)
+            }
+            is BondAction.InitiateCreateBond -> Unit
+            is BondAction.None -> Unit
+        }
+    }
 
     @SuppressLint("MissingPermission")
     private fun startGattSetup(gatt: BluetoothGatt) {
@@ -1423,6 +1673,8 @@ class AndroidBleRepository(
         invalidateScan()
         statusNotificationGate.resetConnection()
         transferTerminalBoundary.reset()
+        bondCoordinator.reset()
+        unregisterBondStateReceiver()
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
         cancellingTransferGeneration = null
@@ -1455,6 +1707,8 @@ class AndroidBleRepository(
             isScanning = false,
             isConnecting = false,
             isConnected = false,
+            isBonding = false,
+            isBonded = false,
             disconnectReconnectState = "Disconnected",
             servicesDiscovered = false,
             serviceUuidFound = false,
@@ -1469,6 +1723,8 @@ class AndroidBleRepository(
         invalidateScan()
         statusNotificationGate.resetConnection()
         transferTerminalBoundary.reset()
+        bondCoordinator.reset()
+        unregisterBondStateReceiver()
         val generation = activeTransferGeneration
         activeTransferGeneration = 0L
         cancellingTransferGeneration = null
@@ -1504,6 +1760,8 @@ class AndroidBleRepository(
             isScanning = false,
             isConnecting = false,
             isConnected = false,
+            isBonding = false,
+            isBonded = false,
             disconnectReconnectState = errorMessage ?: "Disconnected",
             servicesDiscovered = false,
             serviceUuidFound = false,
@@ -1614,6 +1872,7 @@ class AndroidBleRepository(
         transferBinary(binary, crc32, isTestRoute = false)
     }
 
+    @SuppressLint("MissingPermission")
     private fun transferBinary(binary: ByteArray, crc32: Long, isTestRoute: Boolean = false) {
         val actionName = if (isTestRoute) "test route" else "route"
 
@@ -1649,6 +1908,27 @@ class AndroidBleRepository(
         val gatt = bluetoothGatt
         if (gatt == null || (_connectionState.value != ConnectionState.Connected && _connectionState.value != ConnectionState.RouteReady)) {
             val err = "Cannot send $actionName: MotoNav-01 is not connected"
+            Log.e(TAG, err)
+            _lastError.value = err
+            _diagnostics.value = _diagnostics.value.copy(lastError = err)
+            return
+        }
+
+        // 5. Require the active device to be securely paired and bonded before START_ROUTE
+        val device = gatt.device
+        val bondState = try {
+            device?.bondState
+        } catch (e: SecurityException) {
+            null
+        }
+        if (device == null || !bondCoordinator.isBonded(bondState)) {
+            val bondDesc = when (bondState) {
+                BluetoothDevice.BOND_BONDING -> "BOND_BONDING"
+                BluetoothDevice.BOND_NONE -> "BOND_NONE"
+                BluetoothDevice.BOND_BONDED -> "BOND_BONDED"
+                else -> "UNKNOWN"
+            }
+            val err = "Cannot send $actionName: MotoNav-01 is not securely paired/bonded (bondState=$bondDesc)"
             Log.e(TAG, err)
             _lastError.value = err
             _diagnostics.value = _diagnostics.value.copy(lastError = err)

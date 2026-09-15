@@ -27,6 +27,8 @@ data class BleDiagnostics(
     val discoveredRssi: Int? = null,
     val isConnecting: Boolean = false,
     val isConnected: Boolean = false,
+    val isBonding: Boolean = false,
+    val isBonded: Boolean = false,
     val servicesDiscovered: Boolean = false,
     val serviceUuidFound: Boolean = false,
     val controlCharacteristicFound: Boolean = false,
