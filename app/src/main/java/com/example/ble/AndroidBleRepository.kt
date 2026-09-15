@@ -1200,11 +1200,7 @@ class AndroidBleRepository(
         connectionEpoch = epoch
         bondCoordinator.begin(epoch, device.address)
         registerBondStateReceiver(epoch)
-        val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, false, gattCallback)
-        }
+        val gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
         bluetoothGatt = gatt
         gattOperationQueue = gatt?.let {
             GattOperationQueue(
@@ -1599,6 +1595,7 @@ class AndroidBleRepository(
         readStatusCharacteristic(gatt, characteristic, description)
     }
 
+    @SuppressLint("MissingPermission")
     private fun queueRssiRead(gatt: BluetoothGatt) {
         val queue = gattOperationQueue ?: return
         if (!isActiveGatt(gatt)) return
@@ -1719,6 +1716,7 @@ class AndroidBleRepository(
         )
     }
 
+    @SuppressLint("MissingPermission")
     private fun disconnectAndCleanup(errorMessage: String?) {
         invalidateScan()
         statusNotificationGate.resetConnection()
@@ -1979,10 +1977,10 @@ class AndroidBleRepository(
 
         transferJob = scope.launch {
             try {
-            previousTransferJob?.join()
-            if (activeTransferGeneration != transferGeneration) return@launch
+                previousTransferJob?.join()
+                if (activeTransferGeneration != transferGeneration) return@launch
 
-            val routeReadyGeneration = routeReadyEventTracker.beginTransfer()
+                val routeReadyGeneration = routeReadyEventTracker.beginTransfer()
                 Log.i(TAG, "Starting MotoNav route transfer ($actionName, size: ${binary.size} bytes, CRC: $hexCrc)...")
                 if (activeTransferGeneration != transferGeneration) return@launch
                 _connectionState.value = ConnectionState.Transferring

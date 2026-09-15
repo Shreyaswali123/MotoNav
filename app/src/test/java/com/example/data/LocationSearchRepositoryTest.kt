@@ -52,6 +52,26 @@ class LocationSearchRepositoryTest {
             .build()
     }
 
+    private fun createRepo(
+        httpClient: OkHttpClient = createMockClient(),
+        baseUrl: String = DefaultLocationSearchRepository.DEFAULT_BASE_URL,
+        defaultCountryCode: String? = "in",
+        minRequestIntervalMs: Long = DefaultLocationSearchRepository.DEFAULT_MIN_REQUEST_INTERVAL_MS,
+        nanoTimeProvider: () -> Long = { System.nanoTime() },
+        delayer: suspend (Long) -> Unit = { delay(it) },
+        photonProvider: PlaceSearchProvider? = null
+    ): DefaultLocationSearchRepository {
+        return DefaultLocationSearchRepository(
+            httpClient = httpClient,
+            baseUrl = baseUrl,
+            defaultCountryCode = defaultCountryCode,
+            minRequestIntervalMs = minRequestIntervalMs,
+            nanoTimeProvider = nanoTimeProvider,
+            delayer = delayer,
+            photonProvider = photonProvider
+        )
+    }
+
     @Test
     fun testSearchKnownPlaceReturnsResults() = runBlocking {
         // Requirement 13A: Search for a known place returns results
@@ -67,7 +87,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = mockJson)
         )
 
@@ -93,7 +113,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = mockJson)
         )
 
@@ -124,7 +144,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = mockJson)
         )
 
@@ -139,7 +159,7 @@ class LocationSearchRepositoryTest {
     @Test
     fun testEmptyResultHandledCorrectly() = runBlocking {
         // Requirement 13D: Empty result is handled correctly
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = "[]")
         )
 
@@ -152,7 +172,7 @@ class LocationSearchRepositoryTest {
     @Test
     fun testNetworkFailureHandledSeparatelyFromEmptyResults() = runBlocking {
         // Requirement 13E: Network failure is handled separately from empty results
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(throwIoException = true)
         )
 
@@ -164,7 +184,7 @@ class LocationSearchRepositoryTest {
 
     @Test
     fun testHttpErrorHandledAsNetworkFailure() = runBlocking {
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(statusCode = 503, responseBody = "Service Unavailable")
         )
 
@@ -176,7 +196,7 @@ class LocationSearchRepositoryTest {
 
     @Test
     fun testMalformedResponseHandledAsMalformedResponse() = runBlocking {
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = "{ not valid json array }")
         )
 
@@ -187,7 +207,7 @@ class LocationSearchRepositoryTest {
     @Test
     fun testExistingPopularLocationsStillWork() = runBlocking {
         // Requirement 13H: Existing popular locations still work
-        val repo = DefaultLocationSearchRepository()
+        val repo = createRepo()
         val popular = repo.getPopularLocations()
 
         assertTrue("Popular locations must not be empty", popular.isNotEmpty())
@@ -232,7 +252,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = createMockClient(responseBody = mockJson)
         )
 
@@ -275,7 +295,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(httpClient = createMockClient(responseBody = mockJson))
+        val repo = createRepo(httpClient = createMockClient(responseBody = mockJson))
         val result = repo.search("KLE Tech")
 
         assertTrue("Searching KLE Tech should succeed", result is LocationSearchResult.Success)
@@ -298,7 +318,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(httpClient = createMockClient(responseBody = mockJson))
+        val repo = createRepo(httpClient = createMockClient(responseBody = mockJson))
         val resultLower = repo.search("kle tech")
         val resultUpper = repo.search("KLE TECH")
         val resultMixed = repo.search("kLe TeCh")
@@ -328,7 +348,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("   KLE     Technological    University   ")
 
         assertTrue(result is LocationSearchResult.Success)
@@ -351,7 +371,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         repo.search("K.L.E. Tech! Hubballi?")
 
         assertNotNull(capturedQuery)
@@ -375,7 +395,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(httpClient = createMockClient(responseBody = mockJson))
+        val repo = createRepo(httpClient = createMockClient(responseBody = mockJson))
         val resCompound = repo.search("TolanKere")
         val resSeparated = repo.search("Tolan Kere")
 
@@ -419,7 +439,7 @@ class LocationSearchRepositoryTest {
             ]
         """.trimIndent()
 
-        val repo = DefaultLocationSearchRepository(httpClient = createMockClient(responseBody = mockJson))
+        val repo = createRepo(httpClient = createMockClient(responseBody = mockJson))
         val result = repo.search("Hubballi Station")
 
         assertTrue(result is LocationSearchResult.Success)
@@ -444,7 +464,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         repo.search("Hubballi")
 
         assertTrue("At least one request should be made", capturedUrls.isNotEmpty())
@@ -474,7 +494,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("Eiffel Tower")
 
         assertTrue(result is LocationSearchResult.Success)
@@ -509,7 +529,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("Hubballi")
 
         assertTrue("Non-2xx status code must produce NetworkError", result is LocationSearchResult.NetworkError)
@@ -542,7 +562,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("Hubballi")
 
         assertTrue("429 status code must produce RateLimited", result is LocationSearchResult.RateLimited)
@@ -578,7 +598,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("Hubballi")
 
         assertTrue("Valid response must produce Success", result is LocationSearchResult.Success)
@@ -620,7 +640,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         var caughtCancellation = false
         var searchResult: LocationSearchResult? = null
 
@@ -664,7 +684,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         var caughtCancellation = false
 
         repoJob = CoroutineScope(Dispatchers.IO).launch {
@@ -711,7 +731,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         var caughtCancellation = false
 
         repoJob = CoroutineScope(Dispatchers.IO).launch {
@@ -740,7 +760,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
         val result = repo.search("Hubballi")
 
         assertTrue("Genuine network failure must produce NetworkError", result is LocationSearchResult.NetworkError)
@@ -770,7 +790,7 @@ class LocationSearchRepositoryTest {
 
         // Use 250ms interval for deterministic, non-sluggish test execution
         val intervalMs = 250L
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = intervalMs
         )
@@ -808,7 +828,7 @@ class LocationSearchRepositoryTest {
             .build()
 
         val intervalMs = 300L
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = intervalMs
         )
@@ -849,7 +869,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client)
+        val repo = createRepo(httpClient = client)
 
         val result1 = repo.search("Hubballi")
         assertTrue("First search returns Success", result1 is LocationSearchResult.Success)
@@ -890,7 +910,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 0L // no delay for cache functional test
         )
@@ -930,7 +950,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 0L
         )
@@ -967,7 +987,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 0L
         )
@@ -1007,7 +1027,7 @@ class LocationSearchRepositoryTest {
             .build()
 
         // Inject custom delayer that signals when the second request begins waiting for rate limiter
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 5000L, // long interval so second request must wait
             delayer = { delayMs ->
@@ -1062,7 +1082,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 0L
         )
@@ -1104,7 +1124,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client, minRequestIntervalMs = 0L)
+        val repo = createRepo(httpClient = client, minRequestIntervalMs = 0L)
         val result = repo.search("Some Unknown City")
 
         assertTrue("Result must be RateLimited", result is LocationSearchResult.RateLimited)
@@ -1130,7 +1150,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             defaultCountryCode = "in",
             minRequestIntervalMs = 0L
@@ -1173,7 +1193,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(
+        val repo = createRepo(
             httpClient = client,
             minRequestIntervalMs = 0L
         )
@@ -1206,7 +1226,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client, minRequestIntervalMs = 0L)
+        val repo = createRepo(httpClient = client, minRequestIntervalMs = 0L)
         val result = repo.search("Hubballi")
 
         assertTrue("HTTP 500 must produce NetworkError", result is LocationSearchResult.NetworkError)
@@ -1245,7 +1265,7 @@ class LocationSearchRepositoryTest {
             }
             .build()
 
-        val repo = DefaultLocationSearchRepository(httpClient = client, minRequestIntervalMs = 0L)
+        val repo = createRepo(httpClient = client, minRequestIntervalMs = 0L)
 
         var caughtCancellation = false
         val job = CoroutineScope(Dispatchers.IO).launch {

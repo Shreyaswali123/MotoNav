@@ -91,7 +91,8 @@ class DefaultLocationSearchRepository(
     private val defaultCountryCode: String? = "in",
     private val minRequestIntervalMs: Long = DEFAULT_MIN_REQUEST_INTERVAL_MS,
     private val nanoTimeProvider: () -> Long = { System.nanoTime() },
-    private val delayer: suspend (Long) -> Unit = { delay(it) }
+    private val delayer: suspend (Long) -> Unit = { delay(it) },
+    private val photonProvider: PlaceSearchProvider? = defaultPhotonProvider
 ) : LocationSearchRepository {
 
     private val curatedLocations = listOf(
@@ -221,11 +222,52 @@ class DefaultLocationSearchRepository(
 
         currentCoroutineContext().ensureActive()
 
-        // 1. Primary query biased toward India (or configured defaultCountryCode)
+        var photonCandidates: List<SearchLocation>? = null
+
+        // 1. Primary Provider: Photon with geographic bias when coordinates are available
+        if (photonProvider != null) {
+            try {
+                currentCoroutineContext().ensureActive()
+                val photonResults = photonProvider.search(
+                    query = primaryQuery,
+                    lat = userLatitude,
+                    lon = userLongitude,
+                    limit = 10
+                )
+                if (photonResults.isNotEmpty()) {
+                    val rankedPhoton = PlaceResultRanker.rankResults(
+                        locations = photonResults,
+                        query = normalizedQuery,
+                        userLatitude = userLatitude,
+                        userLongitude = userLongitude
+                    )
+                    if (isResultUseful(rankedPhoton, normalizedQuery, userLatitude, userLongitude)) {
+                        return@withContext LocationSearchResult.Success(rankedPhoton)
+                    } else {
+                        photonCandidates = rankedPhoton
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Photon failure (429, 5xx, timeout, network error, malformed response)
+                // Gracefully continue to Nominatim fallback without exposing fatal error
+            }
+        }
+
+        currentCoroutineContext().ensureActive()
+
+        // 2. Fallback Provider: OpenStreetMap Nominatim
+        // (Preserves rate limiting, LRU query cache, country-bias, global search, and candidate expansions)
         when (val firstResult = queryNominatim(primaryQuery, defaultCountryCode)) {
             is NominatimFetchResult.Success -> {
+                val combined = if (!photonCandidates.isNullOrEmpty()) {
+                    deduplicateLocations(firstResult.locations, photonCandidates)
+                } else {
+                    firstResult.locations
+                }
                 val ranked = PlaceResultRanker.rankResults(
-                    locations = firstResult.locations,
+                    locations = combined,
                     query = normalizedQuery,
                     userLatitude = userLatitude,
                     userLongitude = userLongitude
@@ -249,14 +291,19 @@ class DefaultLocationSearchRepository(
             }
             is NominatimFetchResult.Empty -> {
                 // Primary country-biased search returned empty.
-                // 2. Fall back to global search (no country filter) to not prevent searches outside India
+                // 3. Fall back to global search (no country filter)
                 if (!defaultCountryCode.isNullOrBlank()) {
                     currentCoroutineContext().ensureActive()
                     val globalResult = queryNominatim(primaryQuery, countryCode = null)
                     when (globalResult) {
                         is NominatimFetchResult.Success -> {
+                            val combined = if (!photonCandidates.isNullOrEmpty()) {
+                                deduplicateLocations(globalResult.locations, photonCandidates)
+                            } else {
+                                globalResult.locations
+                            }
                             val ranked = PlaceResultRanker.rankResults(
-                                locations = globalResult.locations,
+                                locations = combined,
                                 query = normalizedQuery,
                                 userLatitude = userLatitude,
                                 userLongitude = userLongitude
@@ -273,14 +320,19 @@ class DefaultLocationSearchRepository(
                     }
                 }
 
-                // 3. If still empty, check alternative candidate queries (abbreviation/alias expansions)
+                // 4. If still empty, check alternative candidate queries (abbreviation/alias expansions)
                 for (altQuery in candidates.drop(1)) {
                     currentCoroutineContext().ensureActive()
                     val altResult = queryNominatim(altQuery, defaultCountryCode)
                     when (altResult) {
                         is NominatimFetchResult.Success -> {
+                            val combined = if (!photonCandidates.isNullOrEmpty()) {
+                                deduplicateLocations(altResult.locations, photonCandidates)
+                            } else {
+                                altResult.locations
+                            }
                             val ranked = PlaceResultRanker.rankResults(
-                                locations = altResult.locations,
+                                locations = combined,
                                 query = normalizedQuery,
                                 userLatitude = userLatitude,
                                 userLongitude = userLongitude
@@ -301,6 +353,85 @@ class DefaultLocationSearchRepository(
                 return@withContext LocationSearchResult.Empty(query.trim())
             }
         }
+    }
+
+    internal fun isResultUseful(
+        locations: List<SearchLocation>,
+        query: String,
+        userLatitude: Double?,
+        userLongitude: Double?
+    ): Boolean {
+        if (locations.isEmpty()) return false
+        val cleanQuery = PlaceQueryNormalizer.normalize(query).trim().lowercase(java.util.Locale.ROOT)
+        val queryTokens = cleanQuery.split(" ").filter { it.isNotBlank() }
+        if (queryTokens.isEmpty()) return true
+
+        val top = locations.first()
+        val topNameLower = top.name.lowercase(java.util.Locale.ROOT)
+        val topAddrLower = top.address.lowercase(java.util.Locale.ROOT)
+
+        // 1. Exact phrase or substring match in name is strongly useful
+        if (topNameLower.contains(cleanQuery) || cleanQuery.contains(topNameLower)) {
+            return true
+        }
+
+        // 2. Token overlap analysis
+        val nameTokens = topNameLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
+        val addrTokens = topAddrLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
+
+        val tokenMatchesInName = queryTokens.count { q ->
+            nameTokens.any { it == q || it.startsWith(q) || q.startsWith(it) }
+        }
+        val tokenMatchesInAddr = queryTokens.count { q ->
+            addrTokens.any { it == q || it.startsWith(q) || q.startsWith(it) }
+        }
+
+        // 3. Geographic relevance when user coordinates exist
+        if (userLatitude != null && userLongitude != null &&
+            userLatitude.isFinite() && userLongitude.isFinite() &&
+            top.latitude.isFinite() && top.longitude.isFinite()
+        ) {
+            val distanceKm = PlaceResultRanker.distanceBetweenKm(userLatitude, userLongitude, top.latitude, top.longitude)
+            // Local / regional vicinity (< 100 km)
+            if (distanceKm <= 100.0 && (tokenMatchesInName > 0 || tokenMatchesInAddr > 0)) {
+                return true
+            }
+            // Distant results (> 300 km) require significant token match in name to prevent distant false positives
+            if (distanceKm > 300.0) {
+                val requiredTokens = if (queryTokens.size > 1) 2 else 1
+                return tokenMatchesInName >= requiredTokens
+            }
+            return tokenMatchesInName > 0 || tokenMatchesInAddr >= queryTokens.size
+        }
+
+        // 4. No coordinates available: requires meaningful name or address match
+        return tokenMatchesInName > 0 || (queryTokens.isNotEmpty() && tokenMatchesInAddr >= queryTokens.size)
+    }
+
+    internal fun deduplicateLocations(
+        primary: List<SearchLocation>,
+        secondary: List<SearchLocation>
+    ): List<SearchLocation> {
+        if (primary.isEmpty()) return secondary
+        if (secondary.isEmpty()) return primary
+
+        val result = primary.toMutableList()
+        for (sec in secondary) {
+            val isDuplicate = result.any { prim ->
+                val distKm = PlaceResultRanker.distanceBetweenKm(prim.latitude, prim.longitude, sec.latitude, sec.longitude)
+                distKm < 0.030 || (distKm < 0.100 && areNamesSimilar(prim.name, sec.name))
+            }
+            if (!isDuplicate) {
+                result.add(sec)
+            }
+        }
+        return result
+    }
+
+    private fun areNamesSimilar(name1: String, name2: String): Boolean {
+        val n1 = name1.trim().lowercase(java.util.Locale.ROOT)
+        val n2 = name2.trim().lowercase(java.util.Locale.ROOT)
+        return n1 == n2 || n1.contains(n2) || n2.contains(n1)
     }
 
     data class CacheKey(
@@ -567,6 +698,7 @@ class DefaultLocationSearchRepository(
                 .readTimeout(5, TimeUnit.SECONDS)
                 .build()
         }
-        val instance: DefaultLocationSearchRepository by lazy { DefaultLocationSearchRepository() }
+        val defaultPhotonProvider: PlaceSearchProvider by lazy { PhotonSearchProvider() }
+        val instance: DefaultLocationSearchRepository by lazy { DefaultLocationSearchRepository(photonProvider = defaultPhotonProvider) }
     }
 }
