@@ -1,14 +1,21 @@
 package com.example.ui.components
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -19,6 +26,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.model.Route
@@ -40,6 +48,7 @@ import org.maplibre.compose.overlay.include
 import org.maplibre.compose.sources.GeoJsonData
 import org.maplibre.compose.sources.rememberGeoJsonSource
 import org.maplibre.compose.style.BaseStyle
+import org.maplibre.compose.util.ClickResult
 import org.maplibre.spatialk.geojson.Position
 
 /**
@@ -57,7 +66,12 @@ fun MotoNavMap(
     styleUri: String = MapConfig.DEFAULT_STYLE_URI,
     initialLatitude: Double = MapConfig.DEFAULT_LATITUDE,
     initialLongitude: Double = MapConfig.DEFAULT_LONGITUDE,
-    initialZoom: Double = MapConfig.DEFAULT_ZOOM
+    initialZoom: Double = MapConfig.DEFAULT_ZOOM,
+    droppedPinPosition: Position? = null,
+    droppedPinColor: Color = MotoAmberPrimary,
+    droppedPinLabel: String? = null,
+    onMapClick: ((Position) -> Unit)? = null,
+    onMapLongClick: ((Position) -> Unit)? = null
 ) {
     val cameraState = rememberCameraState(
         firstPosition = CameraPosition(
@@ -138,8 +152,33 @@ fun MotoNavMap(
             modifier = Modifier.fillMaxSize(),
             baseStyle = BaseStyle.Uri(styleUri),
             cameraState = cameraState,
+            onMapClick = { pos, _ ->
+                if (onMapClick != null) {
+                    onMapClick(pos)
+                    ClickResult.Consume
+                } else {
+                    ClickResult.Pass
+                }
+            },
+            onMapLongClick = { pos, _ ->
+                if (onMapLongClick != null) {
+                    onMapLongClick(pos)
+                    ClickResult.Consume
+                } else {
+                    ClickResult.Pass
+                }
+            },
             overlay = MapOverlay {
                 include(MapOverlay.Default)
+
+                // Dropped Pin Marker
+                if (droppedPinPosition != null) {
+                    DroppedPinMarker(
+                        modifier = Modifier.placedAt(droppedPinPosition, Alignment.BottomCenter),
+                        color = droppedPinColor,
+                        label = droppedPinLabel
+                    )
+                }
 
                 // Origin Marker
                 if (originPosition != null) {
@@ -254,6 +293,65 @@ private fun ManeuverMarker(
             fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
             lineHeight = 12.sp
+        )
+    }
+}
+
+@Composable
+fun DroppedPinMarker(
+    modifier: Modifier = Modifier,
+    color: Color = MotoAmberPrimary,
+    label: String? = null
+) {
+    Column(
+        modifier = modifier.testTag("dropped_pin_marker"),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (!label.isNullOrBlank()) {
+            Surface(
+                color = Color(0xEE16191C),
+                shape = RoundedCornerShape(6.dp),
+                border = BorderStroke(1.dp, color.copy(alpha = 0.6f)),
+                modifier = Modifier.padding(bottom = 4.dp)
+            ) {
+                Text(
+                    text = label,
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        Box(
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .background(color.copy(alpha = 0.25f), CircleShape)
+            )
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .background(color, CircleShape)
+                    .border(2.dp, Color(0xFF0F1113), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = "Pin Marker",
+                    tint = Color(0xFF0F1113),
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .size(4.dp)
+                .background(color, CircleShape)
         )
     }
 }

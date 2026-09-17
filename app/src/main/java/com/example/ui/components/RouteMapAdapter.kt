@@ -11,6 +11,7 @@ import org.maplibre.spatialk.geojson.Position
 enum class MapMarkerType {
     ORIGIN,
     DESTINATION,
+    DROPPED_PIN,
     MANEUVER_LEFT,
     MANEUVER_RIGHT,
     MANEUVER_ARRIVE
@@ -189,6 +190,19 @@ object RouteMapAdapter {
             type = MapMarkerType.DESTINATION,
             position = Position(longitude = destination!!.longitude, latitude = destination.latitude),
             label = destination?.name ?: "Destination"
+        )
+    }
+
+    /**
+     * Extracts dropped pin marker for interactive pin dropping.
+     */
+    fun extractDroppedPinMarker(position: Position?, label: String? = null): MapMarker? {
+        if (position == null || !isValidCoordinate(position.latitude, position.longitude)) return null
+        return MapMarker(
+            id = "dropped_pin_marker",
+            type = MapMarkerType.DROPPED_PIN,
+            position = position,
+            label = label ?: "Dropped Pin"
         )
     }
 

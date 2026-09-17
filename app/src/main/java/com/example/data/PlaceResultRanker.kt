@@ -1,15 +1,37 @@
 package com.example.data
 
 /**
- * Utility to rank and sort Nominatim candidate places based on:
- * - Query token relevance (exact, prefix, and synonym matches in place name & address)
- * - Nominatim importance signal
- * - Place type priority (major transportation, educational, civic landmarks vs minor points)
- * - Proximity if reference/current location coordinates are provided
+ * Utility to rank, score, and evaluate place search candidates.
+ * Combines:
+ * 1. Text relevance (discriminative tokens, generic tokens, prefix matches, variant-query matches)
+ * 2. Geographic relevance (proximity bonus and distance penalty when user location is available)
+ * 3. Provider information (place type, importance)
+ * 4. Local candidate bonus (saved/recents)
  *
- * Preserves all valid results without aggressively filtering out candidates.
+ * Implements composite scoring for STRONG results without hardcoding arbitrary radius filters.
  */
 object PlaceResultRanker {
+
+    /**
+     * Centralized score threshold for classifying a candidate as a "STRONG" result.
+     * Tunable from unit tests or runtime configuration.
+     */
+    const val DEFAULT_STRONG_RESULT_THRESHOLD: Double = 55.0
+
+    val GENERIC_TOKENS = setOf(
+        // Honorifics and prefixes
+        "shri", "sri", "dr", "saint", "st", "swami", "swamy", "lord",
+        // Religious place descriptors
+        "mata", "matha", "math", "matta", "temple", "mandir", "masjid", "mosque", "church", "ashram",
+        // Facility / civic / transport types
+        "hospital", "hosp", "clinic", "college", "clg", "university", "univ", "school", "institute",
+        "station", "stn", "railway", "bus", "stand", "stop", "airport", "apt", "aerodrome",
+        // Topological / roadway / geographic descriptors
+        "circle", "cross", "road", "rd", "street", "st", "lane", "nagar", "layout", "colony",
+        "halli", "pura", "pur", "giri", "gudda", "hill", "lake", "kere", "tank", "river",
+        "bridge", "flyover", "gate", "junction", "jn", "junc", "bypass", "plaza", "toll",
+        "bhavan", "complex", "center", "centre", "hotel", "restaurant", "cafe", "park", "garden", "market", "bazaar"
+    )
 
     private val HIGH_PRIORITY_TYPES = setOf(
         "university", "college", "school", "station", "railway_station",
@@ -24,7 +46,37 @@ object PlaceResultRanker {
     )
 
     /**
-     * Ranks and sorts candidate locations based on relevance signals.
+     * Determines whether a candidate location qualifies as a "STRONG" result
+     * based on its composite relevance score.
+     */
+    fun isStrongResult(
+        location: SearchLocation,
+        query: String,
+        userLatitude: Double? = null,
+        userLongitude: Double? = null,
+        threshold: Double = DEFAULT_STRONG_RESULT_THRESHOLD
+    ): Boolean {
+        val score = calculateScore(location, query, userLatitude, userLongitude)
+        return score >= threshold
+    }
+
+    /**
+     * Checks if a list of locations contains at least one STRONG result at the top.
+     */
+    fun hasStrongResult(
+        locations: List<SearchLocation>,
+        query: String,
+        userLatitude: Double? = null,
+        userLongitude: Double? = null,
+        threshold: Double = DEFAULT_STRONG_RESULT_THRESHOLD
+    ): Boolean {
+        if (locations.isEmpty()) return false
+        val top = locations.first()
+        return isStrongResult(top, query, userLatitude, userLongitude, threshold)
+    }
+
+    /**
+     * Ranks and sorts candidate locations based on composite relevance score.
      */
     fun rankResults(
         locations: List<SearchLocation>,
@@ -34,25 +86,67 @@ object PlaceResultRanker {
     ): List<SearchLocation> {
         if (locations.size <= 1) return locations
 
-        val cleanQuery = PlaceQueryNormalizer.normalize(query).lowercase()
-        val queryTokens = cleanQuery.split(" ").filter { it.isNotBlank() }
-        val querySynonyms = queryTokens.map { PlaceQueryNormalizer.getSynonymsForToken(it) }
-
         return locations.sortedWith(
             compareByDescending<SearchLocation> { loc ->
-                calculateScore(loc, cleanQuery, queryTokens, querySynonyms, userLatitude, userLongitude)
+                calculateScore(loc, query, userLatitude, userLongitude)
             }.thenByDescending { it.importance }
         )
     }
 
     /**
-     * Calculates a relevance score for a given candidate location.
+     * Calculates the composite relevance score for a given candidate location.
+     */
+    fun calculateScore(
+        location: SearchLocation,
+        rawQuery: String,
+        userLatitude: Double? = null,
+        userLongitude: Double? = null
+    ): Double {
+        val cleanQuery = PlaceQueryNormalizer.normalize(rawQuery).lowercase()
+        val queryTokens = cleanQuery.split(" ").filter { it.isNotBlank() }
+        val querySynonyms = queryTokens.map { PlaceQueryNormalizer.getSynonymsForToken(it) }
+        val queryVariants = PlaceQueryNormalizer.generateVariants(rawQuery)
+
+        return calculateScoreInternal(
+            location,
+            cleanQuery,
+            queryTokens,
+            querySynonyms,
+            queryVariants,
+            userLatitude,
+            userLongitude
+        )
+    }
+
+    /**
+     * Overload for backwards-compatibility with existing tests.
      */
     fun calculateScore(
         location: SearchLocation,
         cleanQuery: String,
         queryTokens: List<String>,
         querySynonyms: List<Set<String>>,
+        userLatitude: Double?,
+        userLongitude: Double?
+    ): Double {
+        val queryVariants = PlaceQueryNormalizer.generateVariants(cleanQuery)
+        return calculateScoreInternal(
+            location,
+            cleanQuery,
+            queryTokens,
+            querySynonyms,
+            queryVariants,
+            userLatitude,
+            userLongitude
+        )
+    }
+
+    private fun calculateScoreInternal(
+        location: SearchLocation,
+        cleanQuery: String,
+        queryTokens: List<String>,
+        querySynonyms: List<Set<String>>,
+        queryVariants: List<String>,
         userLatitude: Double?,
         userLongitude: Double?
     ): Double {
@@ -63,66 +157,110 @@ object PlaceResultRanker {
         val nameTokens = nameLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
         val addressTokens = addressLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
 
-        // 1. Exact phrase match
+        // A. TEXT RELEVANCE
+        // 1. Phrase matching
         if (nameLower == cleanQuery) {
-            score += 100.0
-        } else if (nameLower.contains(cleanQuery)) {
-            score += 50.0
+            score += 70.0
+        } else if (nameLower.contains(cleanQuery) || (cleanQuery.length >= 6 && cleanQuery.contains(nameLower))) {
+            score += 40.0
         } else if (addressLower.contains(cleanQuery)) {
+            score += 20.0
+        }
+
+        // 2. Query variant match (e.g. compound split "budan gudda" matching "Budan Gudda")
+        val matchesVariant = queryVariants.any { variant ->
+            val v = variant.lowercase()
+            v != cleanQuery && (nameLower == v || nameLower.contains(v) || v.contains(nameLower))
+        }
+        if (matchesVariant) {
             score += 25.0
         }
 
-        // 2. Token matches (exact, synonym, and prefix matches)
-        var matchedTokensCount = 0
+        // 3. Discriminative vs Generic Token Matching
+        var matchedDiscriminativeCount = 0
+        var totalDiscriminativeTokens = 0
+        var matchedGenericCount = 0
+
         for (i in queryTokens.indices) {
             val qToken = queryTokens[i]
             val synonyms = querySynonyms.getOrElse(i) { setOf(qToken) }
+            val isDiscriminative = !GENERIC_TOKENS.contains(qToken)
+
+            if (isDiscriminative) {
+                totalDiscriminativeTokens++
+            }
 
             val inNameExact = nameTokens.contains(qToken)
             val inNameSynonym = nameTokens.any { token -> synonyms.contains(token) }
-            val inNamePrefix = nameTokens.any { it.startsWith(qToken) || qToken.startsWith(it) }
+            val inNamePrefix = nameTokens.any { token ->
+                (token.startsWith(qToken) && qToken.length >= 3) ||
+                (qToken.startsWith(token) && token.length >= 4)
+            }
 
             val inAddrExact = addressTokens.contains(qToken)
             val inAddrSynonym = addressTokens.any { token -> synonyms.contains(token) }
-            val inAddrPrefix = addressTokens.any { it.startsWith(qToken) || qToken.startsWith(it) }
+            val inAddrPrefix = addressTokens.any { token ->
+                (token.startsWith(qToken) && qToken.length >= 3) ||
+                (qToken.startsWith(token) && token.length >= 4)
+            }
 
             when {
                 inNameExact -> {
-                    score += 20.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 40.0 else 12.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
                 inNameSynonym -> {
-                    score += 18.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 35.0 else 10.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
                 inNamePrefix -> {
-                    score += 12.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 28.0 else 8.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
                 inAddrExact -> {
-                    score += 10.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 16.0 else 6.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
                 inAddrSynonym -> {
-                    score += 8.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 14.0 else 5.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
                 inAddrPrefix -> {
-                    score += 6.0
-                    matchedTokensCount++
+                    score += if (isDiscriminative) 10.0 else 4.0
+                    if (isDiscriminative) matchedDiscriminativeCount++ else matchedGenericCount++
                 }
             }
         }
 
-        // Bonus if all query tokens were matched somewhere in name or address
-        if (queryTokens.isNotEmpty() && matchedTokensCount >= queryTokens.size) {
-            score += 30.0
+        // Bonus if all discriminative tokens matched
+        if (totalDiscriminativeTokens > 0 && matchedDiscriminativeCount >= totalDiscriminativeTokens) {
+            score += 20.0
+        } else if (totalDiscriminativeTokens == 0 && matchedGenericCount == queryTokens.size && queryTokens.isNotEmpty()) {
+            score += 15.0
         }
 
-        // 3. Nominatim Importance signal (importance is typically 0.0 to 1.0)
+        // B. GEOGRAPHIC RELEVANCE (Proximity bonus & Distance penalty)
+        if (userLatitude != null && userLongitude != null &&
+            userLatitude.isFinite() && userLongitude.isFinite() &&
+            location.latitude.isFinite() && location.longitude.isFinite()
+        ) {
+            val distKm = distanceBetweenKm(userLatitude, userLongitude, location.latitude, location.longitude)
+            when {
+                distKm < 10.0 -> score += 25.0
+                distKm < 30.0 -> score += 18.0
+                distKm < 60.0 -> score += 12.0
+                distKm < 120.0 -> score += 6.0
+                distKm in 150.0..300.0 -> score -= 15.0
+                distKm in 300.0..600.0 -> score -= 30.0
+                distKm > 600.0 -> score -= 55.0
+            }
+        }
+
+        // C. PROVIDER INFORMATION
+        // Nominatim / Photon importance signal (0.0 to 1.0)
         score += location.importance * 15.0
 
-        // 4. Place Type signal from Nominatim
+        // Place Type priority
         val typeLower = location.placeType.lowercase()
         if (HIGH_PRIORITY_TYPES.contains(typeLower)) {
             score += 8.0
@@ -130,15 +268,10 @@ object PlaceResultRanker {
             score += 4.0
         }
 
-        // 5. Proximity signal (if user location or start point is known)
-        if (userLatitude != null && userLongitude != null &&
-            userLatitude.isFinite() && userLongitude.isFinite() &&
-            location.latitude.isFinite() && location.longitude.isFinite()
-        ) {
-            val distKm = distanceBetweenKm(userLatitude, userLongitude, location.latitude, location.longitude)
-            if (distKm < 50.0) {
-                score += (50.0 - distKm) / 5.0 // up to 10.0 points boost
-            }
+        // D. LOCAL CANDIDATE BONUS
+        // Enough to surface saved/recents quickly, but not overwhelming better remote candidates
+        if (location.id.startsWith("local_") || location.id.startsWith("curated_") || location.id.startsWith("recent_")) {
+            score += 15.0
         }
 
         return score

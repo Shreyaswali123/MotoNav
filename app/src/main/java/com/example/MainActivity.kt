@@ -12,6 +12,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import com.example.ble.BleRepositoryProvider
+import com.example.data.DefaultCurrentLocationProvider
 import com.example.navigation.MotoNavApp
 import com.example.ui.theme.MotoNavTheme
 
@@ -19,6 +20,7 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     BleRepositoryProvider.initialize(applicationContext)
+    DefaultCurrentLocationProvider.initialize(applicationContext)
     enableEdgeToEdge()
     setContent {
       MotoNavTheme {

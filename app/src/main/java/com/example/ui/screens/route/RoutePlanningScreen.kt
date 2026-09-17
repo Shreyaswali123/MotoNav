@@ -1,5 +1,8 @@
 package com.example.ui.screens.route
 
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -34,6 +37,7 @@ import androidx.compose.material.icons.filled.DirectionsBike
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.NearMe
+import androidx.compose.material.icons.filled.PinDrop
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Sync
@@ -64,6 +68,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -73,11 +78,13 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.data.LocationPermissions
 import com.example.data.SearchLocation
 import com.example.model.ConnectionState
 import com.example.model.UnitSystem
 import com.example.ui.components.ConnectionStatusBadge
 import com.example.ui.components.ManeuverItemRow
+import com.example.ui.components.MapPinPickerDialog
 import com.example.ui.components.MotoNavMap
 import com.example.ui.theme.MotoAmberLight
 import com.example.ui.theme.MotoAmberPrimary
@@ -126,12 +133,31 @@ fun RoutePlanningScreen(
     val locationSearchError by viewModel.locationSearchError.collectAsStateWithLifecycle()
     val popularLocations = viewModel.popularLocations
 
+    val context = LocalContext.current
+    val currentLocationState by viewModel.currentLocationState.collectAsStateWithLifecycle()
+    val currentLocationError by viewModel.currentLocationError.collectAsStateWithLifecycle()
+    val isFetchingCurrentLocation by viewModel.isFetchingCurrentLocation.collectAsStateWithLifecycle()
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarseGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        if (fineGranted || coarseGranted) {
+            viewModel.useCurrentLocation(hasPermission = true)
+        } else {
+            viewModel.onLocationPermissionDenied()
+        }
+    }
+
     val hasValidGeneratedRoute = generatedRoute != null &&
         generatedRoute!!.matchesEndpoints(startLocation, destination)
 
     var showLocationPicker by remember { mutableStateOf(false) }
     var pickerTarget by remember { mutableStateOf(LocationPickerTarget.START) }
     var pickerSearchQuery by remember { mutableStateOf("") }
+    var showPinPicker by remember { mutableStateOf(false) }
+    var pinPickerTarget by remember { mutableStateOf(LocationPickerTarget.DESTINATION) }
 
     if (showLocationPicker) {
         LocationSelectionDialog(
@@ -157,11 +183,46 @@ fun RoutePlanningScreen(
                     viewModel.searchLocations("")
                 }
             },
+            onUseCurrentLocation = {
+                showLocationPicker = false
+                pickerSearchQuery = ""
+                viewModel.searchLocations("")
+                if (LocationPermissions.hasLocationPermission(context)) {
+                    viewModel.useCurrentLocation(hasPermission = true)
+                } else {
+                    locationPermissionLauncher.launch(LocationPermissions.REQUIRED_PERMISSIONS)
+                }
+            },
+            onDropPinOnMap = {
+                showLocationPicker = false
+                pickerSearchQuery = ""
+                viewModel.searchLocations("")
+                pinPickerTarget = pickerTarget
+                showPinPicker = true
+            },
             onDismiss = {
                 showLocationPicker = false
                 pickerSearchQuery = ""
                 viewModel.searchLocations("")
             }
+        )
+    }
+
+    if (showPinPicker) {
+        MapPinPickerDialog(
+            target = pinPickerTarget,
+            initialPoint = if (pinPickerTarget == LocationPickerTarget.START) startLocation else destination,
+            onReverseGeocode = { lat, lon -> viewModel.reverseGeocode(lat, lon) },
+            onConfirmLocation = { lat, lon, name ->
+                viewModel.setPinnedLocation(
+                    isStart = (pinPickerTarget == LocationPickerTarget.START),
+                    latitude = lat,
+                    longitude = lon,
+                    resolvedName = name
+                )
+                showPinPicker = false
+            },
+            onDismiss = { showPinPicker = false }
         )
     }
 
@@ -452,77 +513,297 @@ fun RoutePlanningScreen(
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         // Start Point Field
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .clickable {
-                                    pickerTarget = LocationPickerTarget.START
-                                    pickerSearchQuery = ""
-                                    viewModel.searchLocations("")
-                                    showLocationPicker = true
-                                }
-                                .border(
-                                    width = 1.dp,
-                                    color = if (startLocation != null) MotoCyanSecondary.copy(alpha = 0.7f) else MotoCardBorder,
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                                .testTag("start_location_field"),
-                            color = MotoSurfaceVariant
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(38.dp)
-                                        .clip(CircleShape)
-                                        .background(MotoCyanSecondary.copy(alpha = 0.15f)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.MyLocation,
-                                        contentDescription = "Start Point",
-                                        tint = MotoCyanSecondary,
-                                        modifier = Modifier.size(20.dp)
+                        val isCurrentLocationSelected = startLocation?.name == "Current Location"
+
+                        if (startLocation == null) {
+                            Column {
+                                Text(
+                                    text = "START LOCATION",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = MotoCyanSecondary,
+                                        fontSize = 10.sp,
+                                        letterSpacing = 0.5.sp
                                     )
-                                }
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "START POINT (ORIGIN)",
-                                        style = MaterialTheme.typography.labelSmall.copy(
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                // Start options: [ Current GPS ] & [ Drop Pin on Map ]
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Button(
+                                        onClick = {
+                                            if (LocationPermissions.hasLocationPermission(context)) {
+                                                viewModel.useCurrentLocation(hasPermission = true)
+                                            } else {
+                                                locationPermissionLauncher.launch(LocationPermissions.REQUIRED_PERMISSIONS)
+                                            }
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(44.dp)
+                                            .testTag("use_current_location_button"),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MotoCyanSecondary.copy(alpha = 0.15f),
+                                            contentColor = MotoCyanSecondary
+                                        ),
+                                        border = BorderStroke(1.dp, MotoCyanSecondary.copy(alpha = 0.4f)),
+                                        shape = RoundedCornerShape(12.dp),
+                                        enabled = !isFetchingCurrentLocation,
+                                        contentPadding = PaddingValues(horizontal = 8.dp)
+                                    ) {
+                                        if (isFetchingCurrentLocation) {
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(14.dp),
+                                                color = MotoCyanSecondary,
+                                                strokeWidth = 2.dp
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Locating…",
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 12.sp
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = Icons.Default.MyLocation,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Current GPS",
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 12.sp
+                                            )
+                                        }
+                                    }
+
+                                    Button(
+                                        onClick = {
+                                            pinPickerTarget = LocationPickerTarget.START
+                                            showPinPicker = true
+                                        },
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(44.dp)
+                                            .testTag("start_drop_pin_button")
+                                            .testTag("drop_pin_on_map_button"),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MotoCyanSecondary.copy(alpha = 0.15f),
+                                            contentColor = MotoCyanSecondary
+                                        ),
+                                        border = BorderStroke(1.dp, MotoCyanSecondary.copy(alpha = 0.4f)),
+                                        shape = RoundedCornerShape(12.dp),
+                                        contentPadding = PaddingValues(horizontal = 8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.PinDrop,
+                                            contentDescription = "Drop Pin on Map",
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Drop Pin",
                                             fontWeight = FontWeight.Bold,
-                                            color = MotoCyanSecondary,
-                                            fontSize = 10.sp,
-                                            letterSpacing = 0.5.sp
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+
+                                // OR Divider
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(1.dp)
+                                            .background(MotoCardBorder)
+                                    )
+                                    Text(
+                                        text = "OR",
+                                        modifier = Modifier.padding(horizontal = 10.dp),
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = MotoTextMuted,
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontSize = 10.sp
                                         )
                                     )
-                                    Text(
-                                        text = startLocation?.name ?: "Tap to select start point...",
-                                        style = MaterialTheme.typography.bodyMedium.copy(
-                                            fontWeight = if (startLocation != null) FontWeight.SemiBold else FontWeight.Normal,
-                                            color = if (startLocation != null) MotoTextPrimary else MotoTextMuted,
-                                            fontSize = 14.sp
-                                        ),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.testTag("start_location_name")
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(1.dp)
+                                            .background(MotoCardBorder)
                                     )
-                                    if (startLocation != null) {
+                                }
+
+                                // [ Search starting point... ] Surface
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable {
+                                            pickerTarget = LocationPickerTarget.START
+                                            pickerSearchQuery = ""
+                                            viewModel.searchLocations("")
+                                            showLocationPicker = true
+                                        }
+                                        .border(1.dp, MotoCardBorder, RoundedCornerShape(12.dp))
+                                        .testTag("start_location_field")
+                                        .testTag("search_start_location_button"),
+                                    color = MotoSurfaceVariant
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Search,
+                                            contentDescription = "Search starting point",
+                                            tint = MotoTextSecondary,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
                                         Text(
-                                            text = "${String.format("%.4f", startLocation!!.latitude)}°, ${String.format("%.4f", startLocation!!.longitude)}°",
-                                            style = MaterialTheme.typography.bodySmall.copy(
-                                                color = MotoTextSecondary,
-                                                fontSize = 11.sp
+                                            text = "Search starting point...",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                color = MotoTextMuted,
+                                                fontSize = 13.sp
                                             )
                                         )
                                     }
                                 }
-                                if (startLocation != null) {
+
+                                if (currentLocationError != null) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(MotoRedError.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                            .border(1.dp, MotoRedError.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                                            .testTag("current_location_error_banner"),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Warning,
+                                            contentDescription = null,
+                                            tint = MotoRedError,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = currentLocationError ?: "",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = MotoRedError,
+                                                fontWeight = FontWeight.Medium,
+                                                fontSize = 12.sp
+                                            ),
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable {
+                                        pickerTarget = LocationPickerTarget.START
+                                        pickerSearchQuery = ""
+                                        viewModel.searchLocations("")
+                                        showLocationPicker = true
+                                    }
+                                    .border(
+                                        width = 1.dp,
+                                        color = MotoCyanSecondary.copy(alpha = 0.7f),
+                                        shape = RoundedCornerShape(14.dp)
+                                    )
+                                    .testTag("start_location_field"),
+                                color = MotoSurfaceVariant
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(38.dp)
+                                            .clip(CircleShape)
+                                            .background(MotoCyanSecondary.copy(alpha = 0.15f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.MyLocation,
+                                            contentDescription = "Start Point",
+                                            tint = MotoCyanSecondary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "START LOCATION",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = MotoCyanSecondary,
+                                                fontSize = 10.sp,
+                                                letterSpacing = 0.5.sp
+                                            )
+                                        )
+                                        Text(
+                                            text = startLocation?.name ?: "Current Location",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MotoTextPrimary,
+                                                fontSize = 14.sp
+                                            ),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.testTag("start_location_name")
+                                        )
+                                        if (isCurrentLocationSelected) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier.padding(top = 2.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.CheckCircle,
+                                                    contentDescription = null,
+                                                    tint = MotoLimeReady,
+                                                    modifier = Modifier.size(12.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = "Phone GPS Origin",
+                                                    style = MaterialTheme.typography.bodySmall.copy(
+                                                        color = MotoLimeReady,
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Medium
+                                                    )
+                                                )
+                                            }
+                                        } else {
+                                            Text(
+                                                text = "${String.format("%.4f", startLocation!!.latitude)}°, ${String.format("%.4f", startLocation!!.longitude)}°",
+                                                style = MaterialTheme.typography.bodySmall.copy(
+                                                    color = MotoTextSecondary,
+                                                    fontSize = 11.sp
+                                                )
+                                            )
+                                        }
+                                    }
                                     IconButton(
                                         onClick = { viewModel.clearStartLocation() },
                                         modifier = Modifier
@@ -536,6 +817,35 @@ fun RoutePlanningScreen(
                                             modifier = Modifier.size(18.dp)
                                         )
                                     }
+                                }
+                            }
+
+                            if (currentLocationError != null) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MotoRedError.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                                        .border(1.dp, MotoRedError.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                                        .testTag("current_location_error_banner"),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = MotoRedError,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = currentLocationError ?: "",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = MotoRedError,
+                                            fontSize = 11.sp
+                                        ),
+                                        modifier = Modifier.weight(1f)
+                                    )
                                 }
                             }
                         }
@@ -659,6 +969,40 @@ fun RoutePlanningScreen(
                                         )
                                     }
                                 }
+                            }
+                        }
+
+                        // Drop Pin on Map button for Destination when destination is not yet selected
+                        if (destination == null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(
+                                onClick = {
+                                    pinPickerTarget = LocationPickerTarget.DESTINATION
+                                    showPinPicker = true
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
+                                    .testTag("destination_drop_pin_button")
+                                    .testTag("drop_pin_on_map_button"),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MotoAmberPrimary.copy(alpha = 0.15f),
+                                    contentColor = MotoAmberPrimary
+                                ),
+                                border = BorderStroke(1.dp, MotoAmberPrimary.copy(alpha = 0.4f)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PinDrop,
+                                    contentDescription = "Drop Pin on Map",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Drop Pin on Map",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
                             }
                         }
 
@@ -832,13 +1176,37 @@ fun RoutePlanningScreen(
                             )
                         )
 
-                        Text(
-                            text = "${selectedRoute.waypoints.size} WAYPOINTS",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = MotoCyanSecondary
-                            )
-                        )
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    pinPickerTarget = if (startLocation == null) LocationPickerTarget.START else LocationPickerTarget.DESTINATION
+                                    showPinPicker = true
+                                }
+                                .border(1.dp, MotoAmberPrimary.copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                .testTag("map_drop_pin_chip")
+                                .testTag("drop_pin_on_map_button"),
+                            color = MotoAmberPrimary.copy(alpha = 0.15f)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PinDrop,
+                                    contentDescription = "Drop Pin on Map",
+                                    tint = MotoAmberPrimary,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Drop Pin on Map",
+                                    color = MotoAmberPrimary,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
@@ -847,7 +1215,15 @@ fun RoutePlanningScreen(
                         route = selectedRoute,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(260.dp)
+                            .height(260.dp),
+                        onMapClick = {
+                            pinPickerTarget = if (startLocation == null) LocationPickerTarget.START else LocationPickerTarget.DESTINATION
+                            showPinPicker = true
+                        },
+                        onMapLongClick = {
+                            pinPickerTarget = if (startLocation == null) LocationPickerTarget.START else LocationPickerTarget.DESTINATION
+                            showPinPicker = true
+                        }
                     )
                 }
             }
@@ -1051,6 +1427,8 @@ fun LocationSelectionDialog(
     errorMessage: String? = null,
     onSearchQueryChange: (String) -> Unit,
     onLocationSelected: (SearchLocation) -> Unit,
+    onUseCurrentLocation: (() -> Unit)? = null,
+    onDropPinOnMap: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     Dialog(
@@ -1156,6 +1534,87 @@ fun LocationSelectionDialog(
                     )
                 )
 
+                val dialogTargetColor = if (target == LocationPickerTarget.START) MotoCyanSecondary else MotoAmberPrimary
+
+                // Quick Action Bar: Current Location / Drop Pin on Map
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (target == LocationPickerTarget.START && onUseCurrentLocation != null) {
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onUseCurrentLocation() }
+                                .border(1.dp, MotoCyanSecondary.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                                .testTag("dialog_use_current_location_button"),
+                            color = MotoCyanSecondary.copy(alpha = 0.12f)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.MyLocation,
+                                    contentDescription = "Use Current Location",
+                                    tint = MotoCyanSecondary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Current GPS",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = MotoCyanSecondary,
+                                        fontSize = 12.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    if (onDropPinOnMap != null) {
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onDropPinOnMap() }
+                                .border(1.dp, dialogTargetColor.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                                .testTag("dialog_drop_pin_button")
+                                .testTag("drop_pin_on_map_button"),
+                            color = dialogTargetColor.copy(alpha = 0.12f)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.PinDrop,
+                                    contentDescription = "Drop Pin on Map",
+                                    tint = dialogTargetColor,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Drop Pin on Map",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = dialogTargetColor,
+                                        fontSize = 12.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
                 if (isSearching) {
                     Spacer(modifier = Modifier.height(8.dp))
                     LinearProgressIndicator(
@@ -1253,11 +1712,25 @@ fun LocationSelectionDialog(
                                 .testTag("location_search_empty_state"),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                text = "No locations found for \"$searchQuery\"",
-                                style = MaterialTheme.typography.bodyMedium.copy(color = MotoTextMuted),
-                                textAlign = TextAlign.Center
-                            )
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(24.dp)
+                            ) {
+                                Text(
+                                    text = "Not found — drop a pin on the map",
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        color = MotoTextPrimary,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    textAlign = TextAlign.Center
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "No results found for \"$searchQuery\"",
+                                    style = MaterialTheme.typography.bodySmall.copy(color = MotoTextMuted),
+                                    textAlign = TextAlign.Center
+                                )
+                            }
                         }
                     } else if (displayList.isNotEmpty()) {
                     LazyColumn(

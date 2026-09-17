@@ -4,7 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ble.BleRepository
 import com.example.ble.BleRepositoryProvider
+import com.example.data.CurrentLocationProvider
+import com.example.data.DefaultCurrentLocationProvider
 import com.example.data.DefaultLocationSearchRepository
+import com.example.data.LocationResult
 import com.example.data.LocationSearchRepository
 import com.example.data.LocationSearchResult
 import com.example.data.RouteRepository
@@ -20,8 +23,11 @@ import com.example.model.UnitSystem
 import com.example.network.ValhallaRouteRepository
 import com.example.settings.InMemorySettingsRepository
 import com.example.settings.SettingsRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +38,13 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+
+sealed interface CurrentLocationState {
+    object Idle : CurrentLocationState
+    object Loading : CurrentLocationState
+    object Success : CurrentLocationState
+    data class Error(val message: String) : CurrentLocationState
+}
 
 sealed interface RouteGenerationState {
     object Idle : RouteGenerationState
@@ -118,9 +131,22 @@ class RouteViewModel(
     private val settingsRepository: SettingsRepository = InMemorySettingsRepository.instance,
     private val valhallaRouteRepository: ValhallaRouteRepository = ValhallaRouteRepository.instance,
     private val locationSearchRepository: LocationSearchRepository = DefaultLocationSearchRepository.instance,
+    private val currentLocationProvider: CurrentLocationProvider = DefaultCurrentLocationProvider.instance,
     initialStartLocation: RoutePoint? = null,
     initialDestination: RoutePoint? = null
 ) : ViewModel() {
+
+    private val _currentLocationState = MutableStateFlow<CurrentLocationState>(CurrentLocationState.Idle)
+    val currentLocationState: StateFlow<CurrentLocationState> = _currentLocationState.asStateFlow()
+
+    private val _currentLocationError = MutableStateFlow<String?>(null)
+    val currentLocationError: StateFlow<String?> = _currentLocationError.asStateFlow()
+
+    private val _isFetchingCurrentLocation = MutableStateFlow(false)
+    val isFetchingCurrentLocation: StateFlow<Boolean> = _isFetchingCurrentLocation.asStateFlow()
+
+    private var currentLocationJob: Job? = null
+    private var lastAcquiredPhoneLocation: RoutePoint? = null
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
@@ -234,6 +260,13 @@ class RouteViewModel(
     }
 
     fun selectStartLocation(point: RoutePoint): Boolean {
+        currentLocationJob?.cancel()
+        currentLocationJob = null
+        _isFetchingCurrentLocation.value = false
+        if (point.name != "Current Location") {
+            _currentLocationState.value = CurrentLocationState.Idle
+        }
+        _currentLocationError.value = null
         if (!point.latitude.isFinite() || !point.longitude.isFinite() ||
             point.latitude !in -90.0..90.0 || point.longitude !in -180.0..180.0) {
             _locationValidationError.value = "Start location coordinates are invalid"
@@ -259,11 +292,35 @@ class RouteViewModel(
         return true
     }
 
+    suspend fun reverseGeocode(latitude: Double, longitude: Double): String? {
+        return try {
+            locationSearchRepository.reverseGeocode(latitude, longitude)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun setPinnedLocation(isStart: Boolean, latitude: Double, longitude: Double, resolvedName: String? = null): Boolean {
+        val name = resolvedName?.takeIf { it.isNotBlank() }
+            ?: String.format(java.util.Locale.US, "Dropped Pin (%.4f, %.4f)", latitude, longitude)
+        val point = RoutePoint(
+            latitude = latitude,
+            longitude = longitude,
+            name = name
+        )
+        return if (isStart) {
+            selectStartLocation(point)
+        } else {
+            selectDestination(point)
+        }
+    }
+
     fun selectStartLocation(location: SearchLocation): Boolean {
         if (!location.isValid()) {
             _locationValidationError.value = "Start location coordinates are invalid"
             return false
         }
+        locationSearchRepository.recordRecentLocation(location)
         return selectStartLocation(location.toRoutePoint())
     }
 
@@ -272,10 +329,91 @@ class RouteViewModel(
             _locationValidationError.value = "Destination coordinates are invalid"
             return false
         }
+        locationSearchRepository.recordRecentLocation(location)
         return selectDestination(location.toRoutePoint())
     }
 
+    fun onLocationPermissionDenied() {
+        currentLocationJob?.cancel()
+        currentLocationJob = null
+        _isFetchingCurrentLocation.value = false
+        val error = "Location permission is required to use your current location."
+        _currentLocationError.value = error
+        _currentLocationState.value = CurrentLocationState.Error(error)
+    }
+
+    fun useCurrentLocation(hasPermission: Boolean = true) {
+        if (!hasPermission) {
+            onLocationPermissionDenied()
+            return
+        }
+
+        currentLocationJob?.cancel()
+        _currentLocationError.value = null
+        _isFetchingCurrentLocation.value = true
+        _currentLocationState.value = CurrentLocationState.Loading
+
+        currentLocationJob = viewModelScope.launch {
+            try {
+                when (val result = currentLocationProvider.getCurrentLocation()) {
+                    is LocationResult.Success -> {
+                        currentCoroutineContext().ensureActive()
+                        val lat = result.latitude
+                        val lon = result.longitude
+                        if (!lat.isFinite() || !lon.isFinite() ||
+                            lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+                            val error = "Unable to get your current location."
+                            _currentLocationError.value = error
+                            _currentLocationState.value = CurrentLocationState.Error(error)
+                            _isFetchingCurrentLocation.value = false
+                            return@launch
+                        }
+
+                        val point = RoutePoint(
+                            latitude = lat,
+                            longitude = lon,
+                            name = "Current Location"
+                        )
+                        lastAcquiredPhoneLocation = point
+                        selectStartLocation(point)
+                        _currentLocationError.value = null
+                        _isFetchingCurrentLocation.value = false
+                        _currentLocationState.value = CurrentLocationState.Success
+                    }
+                    is LocationResult.PermissionDenied -> {
+                        currentCoroutineContext().ensureActive()
+                        val error = "Location permission is required to use your current location."
+                        _currentLocationError.value = error
+                        _currentLocationState.value = CurrentLocationState.Error(error)
+                        _isFetchingCurrentLocation.value = false
+                    }
+                    is LocationResult.Unavailable -> {
+                        currentCoroutineContext().ensureActive()
+                        val error = "Unable to get your current location."
+                        _currentLocationError.value = error
+                        _currentLocationState.value = CurrentLocationState.Error(error)
+                        _isFetchingCurrentLocation.value = false
+                    }
+                }
+            } catch (e: CancellationException) {
+                // Cancelled - do not mutate route state
+                throw e
+            } catch (e: Throwable) {
+                currentCoroutineContext().ensureActive()
+                val error = "Unable to get your current location."
+                _currentLocationError.value = error
+                _currentLocationState.value = CurrentLocationState.Error(error)
+                _isFetchingCurrentLocation.value = false
+            }
+        }
+    }
+
     fun clearStartLocation() {
+        currentLocationJob?.cancel()
+        currentLocationJob = null
+        _isFetchingCurrentLocation.value = false
+        _currentLocationState.value = CurrentLocationState.Idle
+        _currentLocationError.value = null
         _startLocation.value = null
         _locationValidationError.value = null
         invalidateGeneratedRoute()
@@ -377,13 +515,20 @@ class RouteViewModel(
             return
         }
 
+        // Search local saved/recents immediately and surface matching candidates
+        val localMatches = locationSearchRepository.searchLocal(trimmed)
+        if (localMatches.isNotEmpty()) {
+            _locationSearchResults.value = localMatches
+        }
+
         _isSearchingLocations.value = true
         locationSearchJob = viewModelScope.launch {
             if (debounceMs > 0) {
                 delay(debounceMs)
             }
-            val currentStart = _startLocation.value
-            when (val result = locationSearchRepository.search(trimmed, currentStart?.latitude, currentStart?.longitude)) {
+            val searchLat = _startLocation.value?.latitude ?: lastAcquiredPhoneLocation?.latitude
+            val searchLon = _startLocation.value?.longitude ?: lastAcquiredPhoneLocation?.longitude
+            when (val result = locationSearchRepository.search(trimmed, searchLat, searchLon)) {
                 is LocationSearchResult.Success -> {
                     _locationSearchResults.value = result.locations
                     _locationSearchError.value = null

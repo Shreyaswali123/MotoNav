@@ -15,11 +15,14 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.IOException
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.roundToLong
 
 /**
  * Data model for a searchable geographic place.
@@ -72,18 +75,99 @@ sealed class LocationSearchResult {
 }
 
 /**
+ * Local store for curated places and recently selected search locations.
+ */
+class LocalLocationStore(
+    curated: List<SearchLocation> = emptyList(),
+    private val maxRecentSize: Int = 20
+) {
+    private val lock = Any()
+    private val curatedList = curated.toList()
+    private val recentLocations = mutableListOf<SearchLocation>()
+
+    fun getCuratedLocations(): List<SearchLocation> = curatedList
+
+    fun getRecentLocations(): List<SearchLocation> {
+        synchronized(lock) {
+            return recentLocations.toList()
+        }
+    }
+
+    fun getAllLocations(): List<SearchLocation> {
+        synchronized(lock) {
+            return recentLocations.toList()
+        }
+    }
+
+    fun recordRecent(location: SearchLocation) {
+        if (!location.isValid()) return
+        synchronized(lock) {
+            recentLocations.removeAll { it.id == location.id || (it.latitude == location.latitude && it.longitude == location.longitude) }
+            val recentCandidate = if (location.id.startsWith("recent_") || location.id.startsWith("loc_")) {
+                location
+            } else {
+                location.copy(id = "recent_${location.id}")
+            }
+            recentLocations.add(0, recentCandidate)
+            if (recentLocations.size > maxRecentSize) {
+                recentLocations.removeAt(recentLocations.size - 1)
+            }
+        }
+    }
+
+    fun search(rawQuery: String): List<SearchLocation> {
+        val clean = PlaceQueryNormalizer.normalize(rawQuery).lowercase(Locale.ROOT)
+        if (clean.isBlank()) return emptyList()
+
+        val all = getRecentLocations()
+        if (all.isEmpty()) return emptyList()
+
+        val tokens = clean.split(" ").filter { it.isNotBlank() }
+        val queryVariants = PlaceQueryNormalizer.generateVariants(rawQuery)
+
+        return all.filter { loc ->
+            val nameLower = loc.name.lowercase(Locale.ROOT)
+            val addrLower = loc.address.lowercase(Locale.ROOT)
+
+            // 1. Exact or substring match
+            if (nameLower.contains(clean) || addrLower.contains(clean)) return@filter true
+
+            // 2. Query variant matches
+            if (queryVariants.any { v ->
+                val vl = v.lowercase(Locale.ROOT)
+                nameLower.contains(vl) || addrLower.contains(vl)
+            }) return@filter true
+
+            // 3. Token & synonym overlap
+            tokens.any { token ->
+                val synonyms = PlaceQueryNormalizer.getSynonymsForToken(token)
+                synonyms.any { s -> nameLower.contains(s) || addrLower.contains(s) }
+            }
+        }
+    }
+}
+
+/**
  * Repository interface for searching locations without proprietary/paid APIs.
  */
 interface LocationSearchRepository {
     suspend fun searchLocations(query: String): List<SearchLocation>
     suspend fun search(query: String): LocationSearchResult
     suspend fun search(query: String, userLatitude: Double?, userLongitude: Double?): LocationSearchResult = search(query)
+    suspend fun reverseGeocode(latitude: Double, longitude: Double): String? = null
     fun getPopularLocations(): List<SearchLocation>
+    fun searchLocal(query: String): List<SearchLocation> = emptyList()
+    fun recordRecentLocation(location: SearchLocation) {}
+    fun getSavedAndRecentLocations(): List<SearchLocation> = emptyList()
 }
 
 /**
- * Default implementation combining fast local curated places (Hubballi landmarks,
- * preset ride hubs) with live OpenStreetMap Nominatim geocoding fallback.
+ * Generalized search repository combining:
+ * 1. Local saved & curated places store
+ * 2. Primary Provider: Photon (location-biased, query variant expanded)
+ * 3. Composite score ranking & strong-result evaluation
+ * 4. Fallback Provider: OpenStreetMap Nominatim (location/viewbox-biased, rate-limited, LRU cached)
+ * 5. Candidate merging and deduplication
  */
 class DefaultLocationSearchRepository(
     private val httpClient: OkHttpClient = defaultHttpClient,
@@ -202,7 +286,15 @@ class DefaultLocationSearchRepository(
         )
     )
 
-    override fun getPopularLocations(): List<SearchLocation> = curatedLocations
+    private val localStore = LocalLocationStore(curatedLocations)
+
+    override fun getPopularLocations(): List<SearchLocation> = localStore.getCuratedLocations()
+
+    override fun searchLocal(query: String): List<SearchLocation> = localStore.search(query)
+
+    override fun recordRecentLocation(location: SearchLocation) = localStore.recordRecent(location)
+
+    override fun getSavedAndRecentLocations(): List<SearchLocation> = localStore.getAllLocations()
 
     override suspend fun search(query: String): LocationSearchResult = search(query, null, null)
 
@@ -217,57 +309,98 @@ class DefaultLocationSearchRepository(
             return@withContext LocationSearchResult.Success(curatedLocations)
         }
 
-        val candidates = PlaceQueryNormalizer.getCandidateQueries(query)
-        val primaryQuery = candidates.firstOrNull() ?: normalizedQuery
+        // 1. Search local saved/recents immediately and hold matching candidates
+        val localMatches = searchLocal(normalizedQuery)
+
+        val candidateQueries = PlaceQueryNormalizer.getCandidateQueries(query)
+        val primaryQuery = candidateQueries.firstOrNull() ?: normalizedQuery
 
         currentCoroutineContext().ensureActive()
 
         var photonCandidates: List<SearchLocation>? = null
 
-        // 1. Primary Provider: Photon with geographic bias when coordinates are available
+        // 2. Primary Provider: Photon (with geographic bias when coordinates are available)
         if (photonProvider != null) {
             try {
                 currentCoroutineContext().ensureActive()
-                val photonResults = photonProvider.search(
+                val primaryResults = photonProvider.search(
                     query = primaryQuery,
                     lat = userLatitude,
                     lon = userLongitude,
                     limit = 10
                 )
-                if (photonResults.isNotEmpty()) {
+                if (primaryResults.isNotEmpty()) {
                     val rankedPhoton = PlaceResultRanker.rankResults(
-                        locations = photonResults,
+                        locations = primaryResults,
                         query = normalizedQuery,
                         userLatitude = userLatitude,
                         userLongitude = userLongitude
                     )
                     if (isResultUseful(rankedPhoton, normalizedQuery, userLatitude, userLongitude)) {
-                        return@withContext LocationSearchResult.Success(rankedPhoton)
+                        val merged = deduplicateLocations(localMatches, rankedPhoton)
+                        val finalRanked = PlaceResultRanker.rankResults(merged, normalizedQuery, userLatitude, userLongitude)
+                        return@withContext LocationSearchResult.Success(finalRanked)
                     } else {
                         photonCandidates = rankedPhoton
+                    }
+                }
+
+                // If primary Photon query produced weak/empty results, try bounded high-value variants
+                val queryVariants = PlaceQueryNormalizer.generateVariants(query)
+                    .filter { !it.equals(primaryQuery, ignoreCase = true) }
+                    .take(2)
+
+                for (variant in queryVariants) {
+                    currentCoroutineContext().ensureActive()
+                    val variantResults = photonProvider.search(
+                        query = variant,
+                        lat = userLatitude,
+                        lon = userLongitude,
+                        limit = 10
+                    )
+                    if (variantResults.isNotEmpty()) {
+                        val combinedPhoton = if (!photonCandidates.isNullOrEmpty()) {
+                            deduplicateLocations(photonCandidates, variantResults)
+                        } else {
+                            variantResults
+                        }
+                        val ranked = PlaceResultRanker.rankResults(
+                            locations = combinedPhoton,
+                            query = normalizedQuery,
+                            userLatitude = userLatitude,
+                            userLongitude = userLongitude
+                        )
+                        if (isResultUseful(ranked, normalizedQuery, userLatitude, userLongitude)) {
+                            val merged = deduplicateLocations(localMatches, ranked)
+                            val finalRanked = PlaceResultRanker.rankResults(merged, normalizedQuery, userLatitude, userLongitude)
+                            return@withContext LocationSearchResult.Success(finalRanked)
+                        } else {
+                            photonCandidates = ranked
+                        }
                     }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
                 // Photon failure (429, 5xx, timeout, network error, malformed response)
-                // Gracefully continue to Nominatim fallback without exposing fatal error
+                // Gracefully continue to Nominatim fallback
             }
         }
 
         currentCoroutineContext().ensureActive()
 
-        // 2. Fallback Provider: OpenStreetMap Nominatim
-        // (Preserves rate limiting, LRU query cache, country-bias, global search, and candidate expansions)
-        when (val firstResult = queryNominatim(primaryQuery, defaultCountryCode)) {
+        // 3. Fallback Provider: OpenStreetMap Nominatim
+        // (Preserves rate limiting, LRU query cache, geographic viewbox bias, and candidate expansions)
+        when (val firstResult = queryNominatim(primaryQuery, defaultCountryCode, userLatitude, userLongitude)) {
             is NominatimFetchResult.Success -> {
                 val combined = if (!photonCandidates.isNullOrEmpty()) {
                     deduplicateLocations(firstResult.locations, photonCandidates)
                 } else {
                     firstResult.locations
                 }
+                val merged = deduplicateLocations(localMatches, combined)
                 val ranked = PlaceResultRanker.rankResults(
-                    locations = combined,
+                    locations = merged,
                     query = normalizedQuery,
                     userLatitude = userLatitude,
                     userLongitude = userLongitude
@@ -275,26 +408,31 @@ class DefaultLocationSearchRepository(
                 return@withContext LocationSearchResult.Success(ranked)
             }
             is NominatimFetchResult.RateLimited -> {
+                val fallbackList = if (localMatches.isNotEmpty()) localMatches else getCuratedMatches(normalizedQuery)
                 return@withContext LocationSearchResult.RateLimited(
                     message = firstResult.message,
-                    fallbackLocations = getCuratedMatches(normalizedQuery)
+                    fallbackLocations = fallbackList
                 )
             }
             is NominatimFetchResult.NetworkError -> {
+                val fallbackList = if (localMatches.isNotEmpty()) localMatches else getCuratedMatches(normalizedQuery)
                 return@withContext LocationSearchResult.NetworkError(
                     message = firstResult.message,
-                    fallbackLocations = getCuratedMatches(normalizedQuery)
+                    fallbackLocations = fallbackList
                 )
             }
             is NominatimFetchResult.Malformed -> {
+                if (localMatches.isNotEmpty()) {
+                    return@withContext LocationSearchResult.Success(localMatches)
+                }
                 return@withContext LocationSearchResult.MalformedResponse(firstResult.message)
             }
             is NominatimFetchResult.Empty -> {
-                // Primary country-biased search returned empty.
-                // 3. Fall back to global search (no country filter)
+                // Country-biased search returned empty.
+                // 4. Fall back to global search (no country filter)
                 if (!defaultCountryCode.isNullOrBlank()) {
                     currentCoroutineContext().ensureActive()
-                    val globalResult = queryNominatim(primaryQuery, countryCode = null)
+                    val globalResult = queryNominatim(primaryQuery, countryCode = null, userLatitude = userLatitude, userLongitude = userLongitude)
                     when (globalResult) {
                         is NominatimFetchResult.Success -> {
                             val combined = if (!photonCandidates.isNullOrEmpty()) {
@@ -302,8 +440,9 @@ class DefaultLocationSearchRepository(
                             } else {
                                 globalResult.locations
                             }
+                            val merged = deduplicateLocations(localMatches, combined)
                             val ranked = PlaceResultRanker.rankResults(
-                                locations = combined,
+                                locations = merged,
                                 query = normalizedQuery,
                                 userLatitude = userLatitude,
                                 userLongitude = userLongitude
@@ -311,19 +450,20 @@ class DefaultLocationSearchRepository(
                             return@withContext LocationSearchResult.Success(ranked)
                         }
                         is NominatimFetchResult.RateLimited -> {
+                            val fallbackList = if (localMatches.isNotEmpty()) localMatches else getCuratedMatches(normalizedQuery)
                             return@withContext LocationSearchResult.RateLimited(
                                 message = globalResult.message,
-                                fallbackLocations = getCuratedMatches(normalizedQuery)
+                                fallbackLocations = fallbackList
                             )
                         }
                         else -> { /* continue to alternative candidates */ }
                     }
                 }
 
-                // 4. If still empty, check alternative candidate queries (abbreviation/alias expansions)
-                for (altQuery in candidates.drop(1)) {
+                // 5. If still empty, check alternative candidate queries (abbreviation/alias/compound expansions)
+                for (altQuery in candidateQueries.drop(1)) {
                     currentCoroutineContext().ensureActive()
-                    val altResult = queryNominatim(altQuery, defaultCountryCode)
+                    val altResult = queryNominatim(altQuery, defaultCountryCode, userLatitude, userLongitude)
                     when (altResult) {
                         is NominatimFetchResult.Success -> {
                             val combined = if (!photonCandidates.isNullOrEmpty()) {
@@ -331,8 +471,9 @@ class DefaultLocationSearchRepository(
                             } else {
                                 altResult.locations
                             }
+                            val merged = deduplicateLocations(localMatches, combined)
                             val ranked = PlaceResultRanker.rankResults(
-                                locations = combined,
+                                locations = merged,
                                 query = normalizedQuery,
                                 userLatitude = userLatitude,
                                 userLongitude = userLongitude
@@ -340,9 +481,10 @@ class DefaultLocationSearchRepository(
                             return@withContext LocationSearchResult.Success(ranked)
                         }
                         is NominatimFetchResult.RateLimited -> {
+                            val fallbackList = if (localMatches.isNotEmpty()) localMatches else getCuratedMatches(normalizedQuery)
                             return@withContext LocationSearchResult.RateLimited(
                                 message = altResult.message,
-                                fallbackLocations = getCuratedMatches(normalizedQuery)
+                                fallbackLocations = fallbackList
                             )
                         }
                         else -> { /* continue */ }
@@ -350,6 +492,17 @@ class DefaultLocationSearchRepository(
                 }
 
                 currentCoroutineContext().ensureActive()
+
+                // If any local matches or partial photon results exist, return them
+                if (localMatches.isNotEmpty()) {
+                    val ranked = PlaceResultRanker.rankResults(localMatches, normalizedQuery, userLatitude, userLongitude)
+                    return@withContext LocationSearchResult.Success(ranked)
+                }
+
+                if (!photonCandidates.isNullOrEmpty()) {
+                    return@withContext LocationSearchResult.Success(photonCandidates)
+                }
+
                 return@withContext LocationSearchResult.Empty(query.trim())
             }
         }
@@ -359,53 +512,10 @@ class DefaultLocationSearchRepository(
         locations: List<SearchLocation>,
         query: String,
         userLatitude: Double?,
-        userLongitude: Double?
+        userLongitude: Double?,
+        threshold: Double = PlaceResultRanker.DEFAULT_STRONG_RESULT_THRESHOLD
     ): Boolean {
-        if (locations.isEmpty()) return false
-        val cleanQuery = PlaceQueryNormalizer.normalize(query).trim().lowercase(java.util.Locale.ROOT)
-        val queryTokens = cleanQuery.split(" ").filter { it.isNotBlank() }
-        if (queryTokens.isEmpty()) return true
-
-        val top = locations.first()
-        val topNameLower = top.name.lowercase(java.util.Locale.ROOT)
-        val topAddrLower = top.address.lowercase(java.util.Locale.ROOT)
-
-        // 1. Exact phrase or substring match in name is strongly useful
-        if (topNameLower.contains(cleanQuery) || cleanQuery.contains(topNameLower)) {
-            return true
-        }
-
-        // 2. Token overlap analysis
-        val nameTokens = topNameLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
-        val addrTokens = topAddrLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
-
-        val tokenMatchesInName = queryTokens.count { q ->
-            nameTokens.any { it == q || it.startsWith(q) || q.startsWith(it) }
-        }
-        val tokenMatchesInAddr = queryTokens.count { q ->
-            addrTokens.any { it == q || it.startsWith(q) || q.startsWith(it) }
-        }
-
-        // 3. Geographic relevance when user coordinates exist
-        if (userLatitude != null && userLongitude != null &&
-            userLatitude.isFinite() && userLongitude.isFinite() &&
-            top.latitude.isFinite() && top.longitude.isFinite()
-        ) {
-            val distanceKm = PlaceResultRanker.distanceBetweenKm(userLatitude, userLongitude, top.latitude, top.longitude)
-            // Local / regional vicinity (< 100 km)
-            if (distanceKm <= 100.0 && (tokenMatchesInName > 0 || tokenMatchesInAddr > 0)) {
-                return true
-            }
-            // Distant results (> 300 km) require significant token match in name to prevent distant false positives
-            if (distanceKm > 300.0) {
-                val requiredTokens = if (queryTokens.size > 1) 2 else 1
-                return tokenMatchesInName >= requiredTokens
-            }
-            return tokenMatchesInName > 0 || tokenMatchesInAddr >= queryTokens.size
-        }
-
-        // 4. No coordinates available: requires meaningful name or address match
-        return tokenMatchesInName > 0 || (queryTokens.isNotEmpty() && tokenMatchesInAddr >= queryTokens.size)
+        return PlaceResultRanker.hasStrongResult(locations, query, userLatitude, userLongitude, threshold)
     }
 
     internal fun deduplicateLocations(
@@ -417,26 +527,59 @@ class DefaultLocationSearchRepository(
 
         val result = primary.toMutableList()
         for (sec in secondary) {
-            val isDuplicate = result.any { prim ->
+            val dupIndex = result.indexOfFirst { prim ->
                 val distKm = PlaceResultRanker.distanceBetweenKm(prim.latitude, prim.longitude, sec.latitude, sec.longitude)
-                distKm < 0.030 || (distKm < 0.100 && areNamesSimilar(prim.name, sec.name))
+                distKm < 0.030 || (distKm < 0.150 && areNamesSimilar(prim.name, sec.name))
             }
-            if (!isDuplicate) {
+            if (dupIndex >= 0) {
+                val existing = result[dupIndex]
+                result[dupIndex] = selectBestCandidate(existing, sec)
+            } else {
                 result.add(sec)
             }
         }
         return result
     }
 
+    private fun selectBestCandidate(first: SearchLocation, second: SearchLocation): SearchLocation {
+        val elevation = if (first.elevationMeters > 0.0) first.elevationMeters else second.elevationMeters
+        val importance = maxOf(first.importance, second.importance)
+        val placeType = first.placeType.ifBlank { second.placeType }
+        val category = first.category.ifBlank { second.category }
+
+        // Keep local/curated title for rider familiarity if present, but enrich with longer address
+        val name = if (first.id.startsWith("loc_") || first.id.startsWith("curated_")) {
+            first.name
+        } else if (second.id.startsWith("loc_") || second.id.startsWith("curated_")) {
+            second.name
+        } else if (first.name.length >= second.name.length) {
+            first.name
+        } else {
+            second.name
+        }
+
+        val address = if (first.address.length >= second.address.length) first.address else second.address
+
+        return first.copy(
+            name = name,
+            address = address,
+            elevationMeters = elevation,
+            importance = importance,
+            placeType = placeType,
+            category = category
+        )
+    }
+
     private fun areNamesSimilar(name1: String, name2: String): Boolean {
-        val n1 = name1.trim().lowercase(java.util.Locale.ROOT)
-        val n2 = name2.trim().lowercase(java.util.Locale.ROOT)
+        val n1 = name1.trim().lowercase(Locale.ROOT)
+        val n2 = name2.trim().lowercase(Locale.ROOT)
         return n1 == n2 || n1.contains(n2) || n2.contains(n1)
     }
 
     data class CacheKey(
         val normalizedQuery: String,
-        val countryCode: String?
+        val countryCode: String?,
+        val viewboxKey: String? = null
     )
 
     private class LruQueryCache(private val maxSize: Int = DEFAULT_CACHE_MAX_SIZE) {
@@ -511,12 +654,24 @@ class DefaultLocationSearchRepository(
 
     private class HttpStatusException(val code: Int) : Exception("HTTP $code")
 
-    private suspend fun queryNominatim(queryStr: String, countryCode: String?): NominatimFetchResult {
+    private suspend fun queryNominatim(
+        queryStr: String,
+        countryCode: String?,
+        userLatitude: Double? = null,
+        userLongitude: Double? = null
+    ): NominatimFetchResult {
         currentCoroutineContext().ensureActive()
 
-        val normalizedQuery = queryStr.trim().lowercase()
-        val normalizedCountry = countryCode?.trim()?.lowercase()?.ifEmpty { null }
-        val cacheKey = CacheKey(normalizedQuery, normalizedCountry)
+        val normalizedQuery = queryStr.trim().lowercase(Locale.ROOT)
+        val normalizedCountry = countryCode?.trim()?.lowercase(Locale.ROOT)?.ifEmpty { null }
+        val viewboxKey = if (userLatitude != null && userLongitude != null &&
+            userLatitude.isFinite() && userLongitude.isFinite()
+        ) {
+            String.format(Locale.ROOT, "%.2f,%.2f", userLatitude, userLongitude)
+        } else {
+            null
+        }
+        val cacheKey = CacheKey(normalizedQuery, normalizedCountry, viewboxKey)
 
         // 1. Check in-memory query cache first (no rate limiting, no network IO)
         val cached = queryCache.get(cacheKey)
@@ -536,7 +691,19 @@ class DefaultLocationSearchRepository(
         }
 
         val countryParam = if (!normalizedCountry.isNullOrBlank()) "&countrycodes=$normalizedCountry" else ""
-        val url = "$baseUrl?q=$encodedQuery&format=json&addressdetails=1&limit=10$countryParam"
+        val viewboxParam = if (userLatitude != null && userLongitude != null &&
+            userLatitude.isFinite() && userLongitude.isFinite()
+        ) {
+            val delta = 0.5
+            val minLon = userLongitude - delta
+            val maxLat = userLatitude + delta
+            val maxLon = userLongitude + delta
+            val minLat = userLatitude - delta
+            "&viewbox=$minLon,$maxLat,$maxLon,$minLat"
+        } else {
+            ""
+        }
+        val url = "$baseUrl?q=$encodedQuery&format=json&addressdetails=1&limit=10$countryParam$viewboxParam"
 
         val request = Request.Builder()
             .url(url)
@@ -601,7 +768,6 @@ class DefaultLocationSearchRepository(
         }
 
         // Cache successful and empty results under synchronization.
-        // Do NOT cache NetworkError, Malformed, or cancellations.
         if (parsedResult is NominatimFetchResult.Success || parsedResult is NominatimFetchResult.Empty) {
             queryCache.put(cacheKey, parsedResult)
         }
@@ -679,12 +845,148 @@ class DefaultLocationSearchRepository(
         }
     }
 
-    private fun getCuratedMatches(query: String): List<SearchLocation> {
-        val clean = query.trim().lowercase()
-        if (clean.isBlank()) return curatedLocations
-        return curatedLocations.filter { loc ->
-            loc.name.lowercase().contains(clean) || loc.address.lowercase().contains(clean)
+    private val reverseCache = LinkedHashMap<Pair<Long, Long>, String>(64, 0.75f, true)
+    private val reverseCacheLock = Any()
+
+    override suspend fun reverseGeocode(latitude: Double, longitude: Double): String? = withContext(Dispatchers.IO) {
+        if (!latitude.isFinite() || !longitude.isFinite() ||
+            latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
+            return@withContext null
         }
+
+        val cacheKey = Pair(
+            (latitude * 10000.0).roundToLong(),
+            (longitude * 10000.0).roundToLong()
+        )
+        synchronized(reverseCacheLock) {
+            reverseCache[cacheKey]?.let { return@withContext it }
+        }
+
+        // 1. Try Photon reverse geocoding
+        val photonResult = tryPhotonReverse(latitude, longitude)
+        if (!photonResult.isNullOrBlank()) {
+            synchronized(reverseCacheLock) {
+                reverseCache[cacheKey] = photonResult
+                if (reverseCache.size > 64) {
+                    val eldest = reverseCache.keys.iterator().next()
+                    reverseCache.remove(eldest)
+                }
+            }
+            return@withContext photonResult
+        }
+
+        // 2. Try Nominatim reverse geocoding
+        val nominatimResult = tryNominatimReverse(latitude, longitude)
+        if (!nominatimResult.isNullOrBlank()) {
+            synchronized(reverseCacheLock) {
+                reverseCache[cacheKey] = nominatimResult
+                if (reverseCache.size > 64) {
+                    val eldest = reverseCache.keys.iterator().next()
+                    reverseCache.remove(eldest)
+                }
+            }
+            return@withContext nominatimResult
+        }
+
+        null
+    }
+
+    private fun tryPhotonReverse(latitude: Double, longitude: Double): String? {
+        val url = "https://photon.komoot.io/reverse?lat=$latitude&lon=$longitude"
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "MotoNav/1.0 (Android Motorcycle Navigation)")
+            .get()
+            .build()
+        return try {
+            val responseBody = httpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.string()
+            } ?: return null
+            val json = JSONObject(responseBody)
+            val features = json.optJSONArray("features") ?: return null
+            if (features.length() == 0) return null
+            val props = features.getJSONObject(0).optJSONObject("properties") ?: return null
+
+            val name = props.optString("name").takeIf { it.isNotBlank() }
+            val street = props.optString("street").takeIf { it.isNotBlank() }
+            val city = props.optString("city").ifBlank {
+                props.optString("town").ifBlank {
+                    props.optString("village")
+                }
+            }.takeIf { it.isNotBlank() }
+            val district = props.optString("district").ifBlank {
+                props.optString("suburb").ifBlank {
+                    props.optString("county")
+                }
+            }.takeIf { it.isNotBlank() }
+
+            buildFormattedAddress(name, street, city, district)
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            null
+        }
+    }
+
+    private fun tryNominatimReverse(latitude: Double, longitude: Double): String? {
+        val url = "https://nominatim.openstreetmap.org/reverse?lat=$latitude&lon=$longitude&format=jsonv2"
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "MotoNav/1.0 (Android Motorcycle Navigation)")
+            .get()
+            .build()
+        return try {
+            val responseBody = httpClient.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                resp.body?.string()
+            } ?: return null
+            val json = JSONObject(responseBody)
+            val name = json.optString("name").takeIf { it.isNotBlank() }
+            val addr = json.optJSONObject("address")
+            val street = addr?.optString("road")?.takeIf { it.isNotBlank() }
+            val city = addr?.optString("city")?.ifBlank {
+                addr.optString("town").ifBlank {
+                    addr.optString("village")
+                }
+            }?.takeIf { it.isNotBlank() }
+            val district = addr?.optString("suburb")?.ifBlank {
+                addr.optString("neighbourhood")
+            }?.takeIf { it.isNotBlank() }
+
+            val formatted = buildFormattedAddress(name, street, city, district)
+            formatted ?: json.optString("display_name").takeIf { it.isNotBlank() }
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            null
+        }
+    }
+
+    private fun buildFormattedAddress(name: String?, street: String?, city: String?, district: String?): String? {
+        val parts = mutableListOf<String>()
+        if (!name.isNullOrBlank()) {
+            parts.add(name)
+        }
+        if (!street.isNullOrBlank() && (parts.isEmpty() || !parts[0].equals(street, ignoreCase = true))) {
+            parts.add(street)
+        }
+        val locality = city ?: district
+        if (!locality.isNullOrBlank() && !parts.any { it.equals(locality, ignoreCase = true) }) {
+            parts.add(locality)
+        }
+        return if (parts.isNotEmpty()) parts.joinToString(", ") else null
+    }
+
+    private fun getCuratedMatches(query: String): List<SearchLocation> {
+        val clean = PlaceQueryNormalizer.normalize(query).lowercase(Locale.ROOT)
+        if (clean.isBlank()) return curatedLocations
+        val tokens = clean.split(" ").filter { it.isNotBlank() }
+        val matches = curatedLocations.filter { loc ->
+            val nameLower = loc.name.lowercase(Locale.ROOT)
+            val addrLower = loc.address.lowercase(Locale.ROOT)
+            nameLower.contains(clean) || addrLower.contains(clean) ||
+                tokens.any { t -> nameLower.contains(t) || addrLower.contains(t) }
+        }
+        return matches.ifEmpty { curatedLocations }
     }
 
     companion object {

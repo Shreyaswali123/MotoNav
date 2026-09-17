@@ -1,6 +1,8 @@
 package com.example.ui.screens.route
 
 import com.example.ble.BleRepository
+import com.example.data.CurrentLocationProvider
+import com.example.data.LocationResult
 import com.example.data.LocationSearchRepository
 import com.example.data.LocationSearchResult
 import com.example.data.SampleRouteRepository
@@ -117,10 +119,18 @@ class RouteViewModelTest {
         }
         var searchCallCount = 0
         var lastQuery: String? = null
+        var lastLat: Double? = null
+        var lastLon: Double? = null
 
         override suspend fun search(query: String): LocationSearchResult {
+            return search(query, null, null)
+        }
+
+        override suspend fun search(query: String, userLatitude: Double?, userLongitude: Double?): LocationSearchResult {
             searchCallCount++
             lastQuery = query
+            lastLat = userLatitude
+            lastLon = userLongitude
             return searchHandler(query)
         }
 
@@ -132,11 +142,30 @@ class RouteViewModelTest {
         }
 
         override fun getPopularLocations(): List<SearchLocation> = popularList
+
+        var reverseGeocodeResult: String? = null
+        var reverseGeocodeCallCount = 0
+
+        override suspend fun reverseGeocode(latitude: Double, longitude: Double): String? {
+            reverseGeocodeCallCount++
+            return reverseGeocodeResult ?: "KLE Tech, Hubballi"
+        }
+    }
+
+    private class FakeCurrentLocationProvider : CurrentLocationProvider {
+        var resultToReturn: LocationResult = LocationResult.Success(15.3647, 75.1240)
+        var callCount = 0
+
+        override suspend fun getCurrentLocation(): LocationResult {
+            callCount++
+            return resultToReturn
+        }
     }
 
     private lateinit var fakeBleRepo: FakeBleRepository
     private lateinit var fakeValhallaRepo: FakeValhallaRouteRepository
     private lateinit var fakeLocationRepo: FakeLocationSearchRepository
+    private lateinit var fakeLocationProvider: FakeCurrentLocationProvider
     private lateinit var sampleRouteRepo: SampleRouteRepository
     private lateinit var settingsRepo: InMemorySettingsRepository
     private lateinit var viewModel: RouteViewModel
@@ -147,6 +176,7 @@ class RouteViewModelTest {
         fakeBleRepo = FakeBleRepository()
         fakeValhallaRepo = FakeValhallaRouteRepository()
         fakeLocationRepo = FakeLocationSearchRepository()
+        fakeLocationProvider = FakeCurrentLocationProvider()
         sampleRouteRepo = SampleRouteRepository()
         settingsRepo = InMemorySettingsRepository()
 
@@ -155,7 +185,8 @@ class RouteViewModelTest {
             bleRepository = fakeBleRepo,
             settingsRepository = settingsRepo,
             valhallaRouteRepository = fakeValhallaRepo,
-            locationSearchRepository = fakeLocationRepo
+            locationSearchRepository = fakeLocationRepo,
+            currentLocationProvider = fakeLocationProvider
         )
     }
 
@@ -1043,5 +1074,170 @@ class RouteViewModelTest {
         assertFalse("isGeneratingRoute must be false after completion", concurrentViewModel.isGeneratingRoute.value)
         assertEquals("Route generation state must be Success", RouteGenerationState.Success, concurrentViewModel.routeGenerationState.value)
         assertNotNull("Generated route must be set", concurrentViewModel.generatedRoute.value)
+    }
+
+    @Test
+    fun testUseCurrentLocation_Success_SetsStartLocationAndInvalidatesRoute() = runTest(testDispatcher) {
+        fakeLocationProvider.resultToReturn = LocationResult.Success(15.3647, 75.1240)
+
+        // Clear any previous start location
+        viewModel.clearStartLocation()
+        assertNull("Start location must be null before useCurrentLocation", viewModel.startLocation.value)
+
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        assertEquals("Provider must be called once", 1, fakeLocationProvider.callCount)
+        val start = viewModel.startLocation.value
+        assertNotNull("Start location must not be null", start)
+        assertEquals("Latitude must match GPS result", 15.3647, start!!.latitude, 0.0001)
+        assertEquals("Longitude must match GPS result", 75.1240, start.longitude, 0.0001)
+        assertEquals("Name must be Current Location", "Current Location", start.name)
+        assertEquals("State must be Success", CurrentLocationState.Success, viewModel.currentLocationState.value)
+        assertNull("Current location error must be null", viewModel.currentLocationError.value)
+    }
+
+    @Test
+    fun testUseCurrentLocation_PermissionDenied_SetsErrorState() = runTest(testDispatcher) {
+        val originalStart = viewModel.startLocation.value
+
+        // When permission is denied via hasPermission = false
+        viewModel.useCurrentLocation(hasPermission = false)
+        advanceUntilIdle()
+
+        assertEquals("Provider must NOT be called when permission is not granted", 0, fakeLocationProvider.callCount)
+        assertEquals("Start location must not change", originalStart, viewModel.startLocation.value)
+        assertTrue("State must be Error", viewModel.currentLocationState.value is CurrentLocationState.Error)
+        assertEquals(
+            "Error message must specify location permission is required",
+            "Location permission is required to use your current location.",
+            (viewModel.currentLocationState.value as CurrentLocationState.Error).message
+        )
+        assertEquals(
+            "Location permission is required to use your current location.",
+            viewModel.currentLocationError.value
+        )
+    }
+
+    @Test
+    fun testUseCurrentLocation_ProviderPermissionDenied_SetsErrorState() = runTest(testDispatcher) {
+        fakeLocationProvider.resultToReturn = LocationResult.PermissionDenied
+
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        assertTrue("State must be Error", viewModel.currentLocationState.value is CurrentLocationState.Error)
+        assertEquals(
+            "Location permission is required to use your current location.",
+            viewModel.currentLocationError.value
+        )
+    }
+
+    @Test
+    fun testUseCurrentLocation_Unavailable_SetsErrorState() = runTest(testDispatcher) {
+        fakeLocationProvider.resultToReturn = LocationResult.Unavailable()
+
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        assertTrue("State must be Error", viewModel.currentLocationState.value is CurrentLocationState.Error)
+        assertEquals(
+            "Unable to get your current location.",
+            (viewModel.currentLocationState.value as CurrentLocationState.Error).message
+        )
+        assertEquals("Unable to get your current location.", viewModel.currentLocationError.value)
+    }
+
+    @Test
+    fun testUseCurrentLocation_InvalidatesPreviouslyGeneratedRoute() = runTest(testDispatcher) {
+        val fakeResult = createFakeConversionResult()
+        fakeValhallaRepo.resultToReturn = Result.success(fakeResult)
+
+        viewModel.generateRoute()
+        advanceUntilIdle()
+        assertNotNull("Generated route must be present before setting new origin", viewModel.generatedRoute.value)
+
+        // User chooses Use Current Location
+        fakeLocationProvider.resultToReturn = LocationResult.Success(15.3500, 75.1300)
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        assertNull("Generated route must be invalidated when origin changes", viewModel.generatedRoute.value)
+        assertEquals("Route generation state must reset to Idle", RouteGenerationState.Idle, viewModel.routeGenerationState.value)
+    }
+
+    @Test
+    fun testSearchLocations_BiasedByAcquiredCurrentLocation() = runTest(testDispatcher) {
+        fakeLocationProvider.resultToReturn = LocationResult.Success(15.3647, 75.1240)
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        viewModel.searchLocations("Hubballi", debounceMs = 0L)
+        advanceUntilIdle()
+
+        assertEquals("Search query must match", "Hubballi", fakeLocationRepo.lastQuery)
+        assertEquals("Search latitude must be biased by current location", 15.3647, fakeLocationRepo.lastLat!!, 0.0001)
+        assertEquals("Search longitude must be biased by current location", 75.1240, fakeLocationRepo.lastLon!!, 0.0001)
+    }
+
+    @Test
+    fun testClearStartLocation_ResetsCurrentLocationState() = runTest(testDispatcher) {
+        fakeLocationProvider.resultToReturn = LocationResult.Success(15.3647, 75.1240)
+        viewModel.useCurrentLocation(hasPermission = true)
+        advanceUntilIdle()
+
+        assertEquals(CurrentLocationState.Success, viewModel.currentLocationState.value)
+        assertNotNull(viewModel.startLocation.value)
+
+        viewModel.clearStartLocation()
+        advanceUntilIdle()
+
+        assertNull("Start location must be null", viewModel.startLocation.value)
+        assertEquals("Current location state must reset to Idle", CurrentLocationState.Idle, viewModel.currentLocationState.value)
+        assertNull("Current location error must be cleared", viewModel.currentLocationError.value)
+    }
+
+    @Test
+    fun testSetPinnedLocationAsDestination_updatesDestinationAndCoordinates() = runTest(testDispatcher) {
+        val success = viewModel.setPinnedLocation(
+            isStart = false,
+            latitude = 15.3647,
+            longitude = 75.1240,
+            resolvedName = "Unkal Lake, Hubballi"
+        )
+        advanceUntilIdle()
+
+        assertTrue("setPinnedLocation should return true for valid coordinates", success)
+        val dest = viewModel.destination.value
+        assertNotNull("Destination must be set", dest)
+        assertEquals("Unkal Lake, Hubballi", dest!!.name)
+        assertEquals(15.3647, dest.latitude, 0.0001)
+        assertEquals(75.1240, dest.longitude, 0.0001)
+    }
+
+    @Test
+    fun testSetPinnedLocationAsStart_updatesStartLocation() = runTest(testDispatcher) {
+        val success = viewModel.setPinnedLocation(
+            isStart = true,
+            latitude = 15.3700,
+            longitude = 75.1300,
+            resolvedName = null // fallback formatted string expected
+        )
+        advanceUntilIdle()
+
+        assertTrue("setPinnedLocation should return true", success)
+        val start = viewModel.startLocation.value
+        assertNotNull("Start location must be set", start)
+        assertEquals("Dropped Pin (15.3700, 75.1300)", start!!.name)
+        assertEquals(15.3700, start.latitude, 0.0001)
+        assertEquals(75.1300, start.longitude, 0.0001)
+    }
+
+    @Test
+    fun testReverseGeocode_callsRepository() = runTest(testDispatcher) {
+        fakeLocationRepo.reverseGeocodeResult = "Glass House, Hubballi"
+        val result = viewModel.reverseGeocode(15.3500, 75.1400)
+        assertEquals(1, fakeLocationRepo.reverseGeocodeCallCount)
+        assertEquals("Glass House, Hubballi", result)
     }
 }
