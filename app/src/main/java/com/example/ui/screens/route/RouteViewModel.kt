@@ -1,5 +1,6 @@
 package com.example.ui.screens.route
 
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ble.BleRepository
@@ -12,6 +13,7 @@ import com.example.data.LocationSearchRepository
 import com.example.data.LocationSearchResult
 import com.example.data.RouteRepository
 import com.example.data.SampleRouteRepository
+import com.example.data.SearchBiasCoordinatesPolicy
 import com.example.data.SearchLocation
 import com.example.model.ConnectionState
 import com.example.model.Maneuver
@@ -374,7 +376,9 @@ class RouteViewModel(
                             longitude = lon,
                             name = "Current Location"
                         )
-                        lastAcquiredPhoneLocation = point
+                        if (!SearchBiasCoordinatesPolicy.isSampleOrInvalid(lat, lon)) {
+                            lastAcquiredPhoneLocation = point
+                        }
                         selectStartLocation(point)
                         _currentLocationError.value = null
                         _isFetchingCurrentLocation.value = false
@@ -407,6 +411,46 @@ class RouteViewModel(
             }
         }
     }
+
+    /**
+     * Passively acquires and caches the phone's physical location for search geographic bias.
+     * Invariant: Does NOT mutate _startLocation or _destination.
+     * Invariant: Does NOT track continuous GPS updates.
+     */
+    fun refreshPhoneLocationForSearch(hasPermission: Boolean = true) {
+        if (!hasPermission) return
+        viewModelScope.launch {
+            try {
+                when (val result = currentLocationProvider.getCurrentLocation()) {
+                    is LocationResult.Success -> {
+                        val lat = result.latitude
+                        val lon = result.longitude
+                        if (lat.isFinite() && lon.isFinite() &&
+                            lat in -90.0..90.0 && lon in -180.0..180.0 &&
+                            !SearchBiasCoordinatesPolicy.isSampleOrInvalid(lat, lon)
+                        ) {
+                            lastAcquiredPhoneLocation = RoutePoint(
+                                latitude = lat,
+                                longitude = lon,
+                                name = "Current Location"
+                            )
+                        }
+                    }
+                    else -> {}
+                }
+            } catch (_: Throwable) {
+                // Non-blocking background acquisition
+            }
+        }
+    }
+
+    @VisibleForTesting
+    internal fun setAcquiredPhoneLocation(point: RoutePoint?) {
+        lastAcquiredPhoneLocation = point
+    }
+
+    @VisibleForTesting
+    internal fun getAcquiredPhoneLocation(): RoutePoint? = lastAcquiredPhoneLocation
 
     fun clearStartLocation() {
         currentLocationJob?.cancel()
@@ -526,8 +570,23 @@ class RouteViewModel(
             if (debounceMs > 0) {
                 delay(debounceMs)
             }
-            val searchLat = _startLocation.value?.latitude ?: lastAcquiredPhoneLocation?.latitude
-            val searchLon = _startLocation.value?.longitude ?: lastAcquiredPhoneLocation?.longitude
+            // CRITICAL ARCHITECTURAL INVARIANT:
+            // SEARCH BIAS IS NO LONGER DERIVED FROM ROUTE START LOCATION.
+            // Phone current location -> Search geographic bias
+            // Route start location -> Route origin
+            // A selected route start, sample route origin (37.7749, -122.4194), or dropped pin
+            // must NEVER be used for search bias.
+            val phone = lastAcquiredPhoneLocation
+            val searchLat = if (phone != null && !SearchBiasCoordinatesPolicy.isSampleOrInvalid(phone.latitude, phone.longitude)) {
+                phone.latitude
+            } else {
+                null
+            }
+            val searchLon = if (phone != null && !SearchBiasCoordinatesPolicy.isSampleOrInvalid(phone.latitude, phone.longitude)) {
+                phone.longitude
+            } else {
+                null
+            }
             when (val result = locationSearchRepository.search(trimmed, searchLat, searchLon)) {
                 is LocationSearchResult.Success -> {
                     _locationSearchResults.value = result.locations

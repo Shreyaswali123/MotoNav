@@ -1,5 +1,7 @@
 package com.example.data
 
+import java.util.Locale
+
 /**
  * Utility to rank, score, and evaluate place search candidates.
  * Combines:
@@ -46,8 +48,43 @@ object PlaceResultRanker {
     )
 
     /**
+     * Inspects whether the query contains an explicit geographic qualifier (e.g. city, district,
+     * state, region, or country) matching this candidate location's address or geographic hierarchy.
+     *
+     * Distinguishes:
+     * A. Nearby / ambiguous / local generic searches (e.g. "gokul road", "kims hospital", "vidyanagar", "clock tower")
+     *    where distant exact matches must not suppress fallback.
+     * B. Explicit distant destination searches (e.g. "delhi airport", "bangalore station", "mumbai hospital", "goa beach")
+     *    where the rider explicitly requested a remote destination.
+     */
+    fun hasExplicitGeographicQualifier(location: SearchLocation, rawQuery: String): Boolean {
+        val cleanQuery = PlaceQueryNormalizer.normalize(rawQuery).lowercase(Locale.ROOT)
+        val queryTokens = cleanQuery.split(" ").filter { it.isNotBlank() && !GENERIC_TOKENS.contains(it) }
+        if (queryTokens.isEmpty()) return false
+
+        val addressLower = location.address.lowercase(Locale.ROOT)
+        val addressTokens = addressLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }.toSet()
+
+        val nameLower = location.name.lowercase(Locale.ROOT)
+        val nameTokens = nameLower.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }.toSet()
+
+        return queryTokens.any { qToken ->
+            val inAddress = addressTokens.contains(qToken) || addressTokens.any { it.startsWith(qToken) && qToken.length >= 4 }
+            val inName = nameTokens.contains(qToken) || nameTokens.any { it.startsWith(qToken) && qToken.length >= 4 }
+            // A token is an explicit geographic qualifier if it matches address components,
+            // or if the query contains multiple tokens and at least one matches the address
+            inAddress && (!inName || queryTokens.size >= 2)
+        }
+    }
+
+    /**
      * Determines whether a candidate location qualifies as a "STRONG" result
      * based on its composite relevance score.
+     *
+     * Invariant: A distant candidate (> 150 km) cannot be classified as STRONG
+     * for an ambiguous/generic query without explicit distant geographic qualification,
+     * preventing distant candidates from suppressing Nominatim fallback while still
+     * keeping them fully discoverable in the search candidate pool.
      */
     fun isStrongResult(
         location: SearchLocation,
@@ -57,7 +94,25 @@ object PlaceResultRanker {
         threshold: Double = DEFAULT_STRONG_RESULT_THRESHOLD
     ): Boolean {
         val score = calculateScore(location, query, userLatitude, userLongitude)
-        return score >= threshold
+        if (score < threshold) return false
+
+        // If user coordinates are provided and candidate is distant (> 150 km)
+        if (userLatitude != null && userLongitude != null &&
+            userLatitude.isFinite() && userLongitude.isFinite() &&
+            location.latitude.isFinite() && location.longitude.isFinite()
+        ) {
+            val distKm = distanceBetweenKm(userLatitude, userLongitude, location.latitude, location.longitude)
+            if (distKm > 150.0) {
+                // A distant candidate is only "STRONG" (suppressing fallback) if the query
+                // explicitly contains a geographic qualifier for that distant location
+                // (e.g. "delhi airport", "bangalore airport", "goa airport").
+                // For ambiguous/generic queries (e.g. "gokul road", "kims hospital", "vidyanagar"),
+                // distant candidates must not automatically suppress fallback.
+                return hasExplicitGeographicQualifier(location, query)
+            }
+        }
+
+        return true
     }
 
     /**
@@ -250,9 +305,21 @@ object PlaceResultRanker {
                 distKm < 30.0 -> score += 18.0
                 distKm < 60.0 -> score += 12.0
                 distKm < 120.0 -> score += 6.0
-                distKm in 150.0..300.0 -> score -= 15.0
-                distKm in 300.0..600.0 -> score -= 30.0
-                distKm > 600.0 -> score -= 55.0
+            }
+
+            // For ambiguous queries with distant matches, apply distance penalty.
+            // But if the query explicitly targeted this distant region (e.g. "delhi airport", "bangalore station"),
+            // do not penalize distance; the rider deliberately requested that distant location.
+            if (distKm > 150.0) {
+                if (hasExplicitGeographicQualifier(location, cleanQuery)) {
+                    score += 10.0
+                } else {
+                    when {
+                        distKm in 150.0..300.0 -> score -= 15.0
+                        distKm in 300.0..600.0 -> score -= 30.0
+                        distKm > 600.0 -> score -= 55.0
+                    }
+                }
             }
         }
 

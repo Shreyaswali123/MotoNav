@@ -60,6 +60,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -153,7 +154,21 @@ fun RoutePlanningScreen(
     val hasValidGeneratedRoute = generatedRoute != null &&
         generatedRoute!!.matchesEndpoints(startLocation, destination)
 
+    // Passively acquire phone physical location for search bias if permissions are already granted.
+    // Invariant: Does not alter start location or route selection.
+    LaunchedEffect(Unit) {
+        if (LocationPermissions.hasLocationPermission(context)) {
+            viewModel.refreshPhoneLocationForSearch(hasPermission = true)
+        }
+    }
+
     var showLocationPicker by remember { mutableStateOf(false) }
+
+    LaunchedEffect(showLocationPicker) {
+        if (showLocationPicker && LocationPermissions.hasLocationPermission(context)) {
+            viewModel.refreshPhoneLocationForSearch(hasPermission = true)
+        }
+    }
     var pickerTarget by remember { mutableStateOf(LocationPickerTarget.START) }
     var pickerSearchQuery by remember { mutableStateOf("") }
     var showPinPicker by remember { mutableStateOf(false) }
