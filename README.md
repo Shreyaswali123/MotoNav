@@ -147,7 +147,6 @@ After the route is successfully stored, the smartphone can disconnect. The embed
 MotoNav/
 ├── app/                  # Android application
 ├── firmware/             # ESP32-S3 firmware
-├── docs/                 # Project documentation
 ├── README.md
 ├── build.gradle.kts
 ├── settings.gradle.kts
